@@ -6,14 +6,17 @@ import random
 import os
 import logging
 from collections import defaultdict, deque
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
+import aiosqlite
+import json
+from web3 import AsyncWeb3, AsyncHTTPProvider
 
 load_dotenv()
 
 # =============================================================================
-# CONFIGURATION (RELAXED)
+# CONFIGURATION
 # =============================================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -32,41 +35,125 @@ GECKO_TO_CHAIN["polygon_pos"] = "polygon"
 
 MULTICALL3_ADDR = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
-V3_DEX_IDS = {
-    "uniswap-v3", "pancakeswap-v3", "camelot-v3", "sushiswap-v3",
-    "aerodrome-cl", "velodrome-v2", "quickswap-v3", "zyberswap",
-    "ramses-v2", "thena-fusion", "algebra",
+# DEX fee mapping (basis points)
+DEX_FEES = {
+    "uniswap": 30,
+    "pancakeswap": 25,
+    "sushiswap": 30,
+    "camelot": 30,
+    "aerodrome": 5,
+    "velodrome": 5,
+    "quickswap": 30,
+    "thena": 5,
+    "ramses": 5,
+    "zyberswap": 30,
+    "algebra": 30,
+    "gecko": 30,
+    "unknown": 30,
+}
+
+# Chain gas costs (USD)
+GAS_COST_CHAIN = {
+    "ethereum": 8.0,
+    "arbitrum": 0.7,
+    "base": 0.15,
+    "polygon": 0.2,
+    "bsc": 0.25,
+    "optimism": 0.5,
+}
+GAS_MULTIPLIER = 1.2
+
+# Chain latency factor (lower is faster)
+CHAIN_LATENCY = {
+    "ethereum": 1.0,
+    "arbitrum": 0.3,
+    "base": 0.2,
+    "polygon": 0.4,
+    "bsc": 0.4,
+    "optimism": 0.5,
 }
 
 STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD",
                       "FRAX", "LUSD", "USDD", "GUSD", "USDP"}
 
-# --- RELAXED FILTERS ---
-MIN_LIQUIDITY             = 10_000        # was 20k
-MAX_LIQUIDITY             = 2_000_000     # was 500k
-MIN_VOLUME_LIQ_RATIO      = 0.5           # was 2.0
+# Filters
+MIN_LIQUIDITY             = 10_000
+MAX_LIQUIDITY             = 2_000_000
+MIN_VOLUME_LIQ_RATIO      = 0.3
 MIN_POOLS                 = 2
-MAX_POOLS                 = 10            # was 4
-MIN_OPPORTUNITY_COUNT     = 1             # was 3
-MIN_AVG_SPREAD            = 0.005         # 0.5% – lower to catch small opportunities
-MIN_AVG_DURATION          = 1.5           # was 2.5
+MAX_POOLS                 = 10
+MIN_OPPORTUNITY_COUNT     = 1
+MIN_AVG_SPREAD            = 0.003
+MIN_AVG_DURATION          = 1.5
 MIN_LIQUIDITY_TARGET      = 30_000
 TOP_N_PAIRS               = 8
-MIN_PROFIT_POTENTIAL_USD  = 1.0           # was 8.0 – we'll let observation decide later
+MIN_PROFIT_POTENTIAL_USD  = 1.0
 MAX_SLIPPAGE_IMPACT       = 0.018
 FLASHLOAN_FEE_BPS         = 9
-GAS_COST_USD              = 0.5
 
-OBSERVE_INTERVAL          = 2.0
-SPREAD_HISTORY_LEN        = 60
-RATE_LIMIT_SLEEP          = 0.25
-CONCURRENCY_LIMIT         = 20
+# Additional discovery filters (strengthened)
+DISCOVERY_MIN_VOLUME      = 20_000   # minimum 24h volume
+DISCOVERY_MIN_LIQUIDITY   = 30_000   # minimum liquidity
+
+# Reserve cache TTL (seconds)
+RESERVE_TTL = 10
+
+# Per-pool minimum
+MIN_POOL_LIQUIDITY        = 20_000
+
+# Staleness thresholds (seconds)
+MAX_POOL_AGE              = 30
+MAX_PRICE_JUMP_PCT        = 0.05
+
+# Competition & latency
+CHAIN_DIFFICULTY = {
+    "base": 1,
+    "polygon": 1,
+    "optimism": 2,
+    "arbitrum": 3,
+    "bsc": 3,
+    "ethereum": 4,
+}
+LATENCY_THRESHOLD = 2.0
+OPPORTUNITY_DECAY_THRESHOLD = 1.0
+
+# Observation intervals
+NORMAL_INTERVAL = 2.0
+HOT_INTERVAL = 0.3
+BURST_DETECTION_WINDOW = 5
 
 DEXSCREENER_TOKEN_URL  = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={}"
 GECKO_BASE             = "https://api.geckoterminal.com/api/v2"
 
 DEXSCREENER_QUERIES = ["new", "trending", "hot", "base", "sol", "bsc", "arb", "eth", "polygon"]
+
+# =============================================================================
+# AMM Helpers
+# =============================================================================
+
+def get_amount_out(amount_in: float, reserve_in: float, reserve_out: float, fee_bps: int = 30) -> float:
+    """Constant product AMM with fee. All amounts in normalized token units."""
+    if reserve_in == 0 or reserve_out == 0:
+        return 0.0
+    amount_in_with_fee = amount_in * (10000 - fee_bps)
+    numerator = amount_in_with_fee * reserve_out
+    denominator = reserve_in * 10000 + amount_in_with_fee
+    return numerator / denominator if denominator > 0 else 0.0
+
+def is_healthy_pool(p: Dict) -> bool:
+    """Check if pool has reasonable balance using USD values."""
+    if p["r_base"] <= 0 or p["r_quote"] <= 0:
+        return False
+    price = p["r_quote"] / p["r_base"]
+    base_value = p["r_base"] * price
+    quote_value = p["r_quote"]
+    ratio = base_value / quote_value if quote_value > 0 else 0
+    if ratio > 3 or ratio < 0.33:
+        return False
+    if base_value < 5000:
+        return False
+    return True
 
 # =============================================================================
 # DATA MODELS
@@ -101,6 +188,8 @@ class TokenMemory:
         self.last_liquidity = 0.0
         self.last_update_time = 0.0
         self.missed_opportunities = 0
+        self.decay_avg = 0.0
+        self.alpha_token = False
 
     def update(self, spread, duration, trade_usd=0, net_profit=0):
         self.opportunity_count += 1; n = self.opportunity_count
@@ -115,6 +204,7 @@ class TokenMemory:
             self.last_spike_time = now; self.spike_frequency += 1
         if self._prev_spread and (decay:=self._prev_spread - spread)>0:
             self.spread_decay_rate = (self.spread_decay_rate*(n-1) + decay)/n
+            self.decay_avg = (self.decay_avg*(n-1) + decay)/n
         self._prev_spread = spread
         hour = int(time.time()//3600%24)
         self.time_of_day_histogram[hour] = self.time_of_day_histogram.get(hour,0)+1
@@ -153,32 +243,295 @@ class TokenState:
         self.memory = TokenMemory(token_key)
         self.cex_price = 0.0
         self.dex_spread = 0.0
-        self.profit_potential = 0.0
+        self.max_real_profit = 0.0
+        self.optimal_trade_size = 0.0
+        self.pool_timestamps: Dict[str, float] = {}
+        self.price_history: Dict[str, deque] = {}
+        self.base_decimals = 18
+        self.quote_decimals = 6
+        self.last_reserve_fetch = 0.0
+        self.blacklisted = False
 
     def compute_spreads_and_profit(self):
-        prices = [p["price"] for p in self.pools if p["price"] > 0]
-        if len(prices) >= 2:
-            mn, mx = min(prices), max(prices)
-            self.dex_spread = (mx - mn) / mn if mn > 0 else 0.0
-        else:
+        now = time.time()
+        valid_pools = []
+        for p in self.pools:
+            if p.get("pool_type") != "v2":
+                continue
+            quote = p.get("quote_symbol", "").upper()
+            if quote not in {"USDC", "USDT"}:
+                continue
+            if "timestamp" in p and now - p["timestamp"] > MAX_POOL_AGE:
+                continue
+            if p.get("price", 0) <= 0:
+                continue
+            addr = p.get("pool_address", "")
+            if addr:
+                if addr not in self.price_history:
+                    self.price_history[addr] = deque(maxlen=2)
+                self.price_history[addr].append(p["price"])
+                if len(self.price_history[addr]) == 2:
+                    old, new = self.price_history[addr]
+                    jump = (new - old) / old if old > 0 else 0
+                    if abs(jump) > MAX_PRICE_JUMP_PCT:
+                        continue
+            if "r_base" not in p or "r_quote" not in p:
+                continue
+            if not is_healthy_pool(p):
+                continue
+            valid_pools.append(p)
+
+        if len(valid_pools) < 2:
             self.dex_spread = 0.0
+            self.max_real_profit = 0.0
+            return
 
-        # Use only DEX spread for profit (CEX is optional)
-        total_spread = self.dex_spread
+        prices = []
+        for p in valid_pools:
+            price = p["r_quote"] / p["r_base"] if p["r_base"] > 0 else 0.0
+            if price <= 0:
+                continue
+            prices.append(price)
+        if not prices:
+            self.dex_spread = 0.0
+            return
+        mn, mx = min(prices), max(prices)
+        if mn == 0:
+            self.dex_spread = 0.0
+            return
+        raw_spread = (mx - mn) / mn
+        if raw_spread > 0.05:
+            self.dex_spread = 0.0
+            return
+        if raw_spread < 0.012:
+            self.dex_spread = 0.0
+            return
+        self.dex_spread = raw_spread
 
-        # Realistic trade size: 0.3% of liquidity (not 2%)
-        usable_liquidity = self.liquidity_total * 0.003
-        repeatability = self.memory.compute_repeatability_score() if self.memory.opportunity_count > 0 else 0.3
-        slippage_adjust = 1.0 - MAX_SLIPPAGE_IMPACT
-        gross = total_spread * usable_liquidity * slippage_adjust
-        net = gross - GAS_COST_USD - (gross * FLASHLOAN_FEE_BPS / 10000)
-        self.profit_potential = max(0.0, net)
+        cheapest = min(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
+        most_expensive = max(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
+
+        min_pool_liq_usd = min(cheapest["r_quote"], most_expensive["r_quote"])
+        max_size_usd = min_pool_liq_usd * 0.02
+        test_sizes = [max_size_usd * f for f in [0.1, 0.25, 0.5, 0.75, 1.0]]
+
+        best_profit = 0.0
+        best_size = 0
+        gas_cost = GAS_COST_CHAIN.get(self.chain, 0.5) * GAS_MULTIPLIER
+        competition_penalty = 1 - min(0.5, self.memory.competition_score * 0.05)
+        latency_factor = CHAIN_LATENCY.get(self.chain, 0.5)
+        latency_penalty = 1 - min(0.5, latency_factor * 0.8)
+        difficulty = CHAIN_DIFFICULTY.get(self.chain, 2)
+        difficulty_penalty = 1 - min(0.5, difficulty * 0.1)
+        execution_delay = random.uniform(0.2, 1.5)
+        decay_factor = max(0.5, 1 - execution_delay * 0.3)
+
+        for size_usd in test_sizes:
+            if size_usd > min_pool_liq_usd * 0.02:
+                continue
+
+            # Buy leg
+            amount_base = get_amount_out(
+                size_usd,
+                cheapest["r_quote"],
+                cheapest["r_base"],
+                cheapest["fee_bps"]
+            )
+            if amount_base <= 0:
+                continue
+
+            # Sell leg
+            amount_quote_out = get_amount_out(
+                amount_base,
+                most_expensive["r_base"],
+                most_expensive["r_quote"],
+                most_expensive["fee_bps"]
+            )
+            if amount_quote_out <= 0:
+                continue
+
+            # Reverse symmetry check (tightened to 1%)
+            reverse_base = get_amount_out(
+                amount_quote_out,
+                cheapest["r_quote"],
+                cheapest["r_base"],
+                cheapest["fee_bps"]
+            )
+            if reverse_base < amount_base * 0.99:
+                continue
+
+            # Buy side price impact
+            effective_price = size_usd / amount_base if amount_base > 0 else 0
+            market_price = cheapest["r_quote"] / cheapest["r_base"] if cheapest["r_base"] > 0 else 0
+            if market_price > 0:
+                buy_impact = abs(effective_price - market_price) / market_price
+                if buy_impact > MAX_SLIPPAGE_IMPACT:
+                    continue
+
+            # Sell side price impact
+            sell_price = amount_quote_out / amount_base if amount_base > 0 else 0
+            expected_sell_price = most_expensive["r_quote"] / most_expensive["r_base"] if most_expensive["r_base"] > 0 else 0
+            if expected_sell_price > 0:
+                sell_impact = abs(sell_price - expected_sell_price) / expected_sell_price
+                if sell_impact > MAX_SLIPPAGE_IMPACT:
+                    continue
+
+            profit_usd = amount_quote_out - size_usd
+            flash_fee = size_usd * FLASHLOAN_FEE_BPS / 10000
+            net_profit = profit_usd - gas_cost - flash_fee
+            net_profit *= competition_penalty * latency_penalty * difficulty_penalty * decay_factor
+            # MEV penalty (random 0.7-1.0)
+            net_profit *= random.uniform(0.7, 1.0)
+
+            if net_profit > best_profit:
+                best_profit = net_profit
+                best_size = size_usd
+
+        if best_profit < 0.5:
+            self.max_real_profit = 0.0
+            self.optimal_trade_size = 0.0
+            return
+
+        self.max_real_profit = best_profit
+        self.optimal_trade_size = best_size
 
     def update_from_pools(self, new_pools: List[Dict]):
         self.pools = new_pools
         self.liquidity_total = sum(p["liquidity"] for p in new_pools)
         self.volume_24h = sum(p["volume_24h"] for p in new_pools)
         self.last_update = time.time()
+        for p in new_pools:
+            addr = p.get("pool_address", "")
+            if addr:
+                self.pool_timestamps[addr] = p.get("timestamp", time.time())
+
+
+# =============================================================================
+# ON-CHAIN VALIDATOR (Multicall3)
+# =============================================================================
+
+MULTICALL3_ABI = [{"inputs":[{"components":[{"name":"target","type":"address"},{"name":"callData","type":"bytes"}],"name":"calls","type":"tuple[]"}],"name":"aggregate","outputs":[{"name":"blockNumber","type":"uint256"},{"name":"returnData","type":"bytes[]"}],"stateMutability":"payable","type":"function"}]
+V2_RESERVES_ABI = [{"inputs":[],"name":"getReserves","outputs":[{"name":"_reserve0","type":"uint112"},{"name":"_reserve1","type":"uint112"},{"name":"_blockTimestampLast","type":"uint32"}],"stateMutability":"view","type":"function"}]
+V2_TOKEN0_ABI = [{"inputs":[],"name":"token0","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}]
+V2_TOKEN1_ABI = [{"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}]
+ERC20_DECIMALS_ABI = [{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]
+
+class OnChainValidator:
+    def __init__(self):
+        self._w3 = {}
+        self._mc = {}
+        self._decimals_cache = {}
+        self._sem = asyncio.Semaphore(20)
+
+    def _setup(self, chain):
+        if chain in self._w3:
+            return
+        rpc = EVM_CHAINS[chain]["rpc"]
+        w3 = AsyncWeb3(AsyncHTTPProvider(rpc, request_kwargs={"timeout":5}))
+        self._w3[chain] = w3
+        self._mc[chain] = w3.eth.contract(address=AsyncWeb3.to_checksum_address(MULTICALL3_ADDR), abi=MULTICALL3_ABI)
+
+    async def _batch_call(self, chain, targets, fn_name, abi, decode_types):
+        async with self._sem:
+            self._setup(chain)
+            w3, mc = self._w3[chain], self._mc[chain]
+            if not w3 or not mc:
+                return {}
+            calls = []
+            valid_targets = []
+            for target in targets:
+                if not target:
+                    continue
+                try:
+                    c = w3.eth.contract(address=AsyncWeb3.to_checksum_address(target), abi=abi)
+                    calls.append((AsyncWeb3.to_checksum_address(target), c.encode_abi(fn_name)))
+                    valid_targets.append(target)
+                except Exception:
+                    continue
+            if not calls:
+                return {}
+            from eth_abi import decode as abi_decode
+            results = {}
+            BATCH = 25
+            for i in range(0, len(calls), BATCH):
+                b_calls, b_targets = calls[i:i+BATCH], valid_targets[i:i+BATCH]
+                try:
+                    _, rd = await mc.functions.aggregate(b_calls).call()
+                    for j, data in enumerate(rd):
+                        try:
+                            decoded = abi_decode(decode_types, data)
+                            results[b_targets[j]] = decoded
+                        except Exception:
+                            continue
+                except Exception:
+                    for j, (target, _) in enumerate(b_calls):
+                        try:
+                            c = w3.eth.contract(address=target, abi=abi)
+                            val = await getattr(c.functions, fn_name)().call()
+                            results[b_targets[j]] = val if isinstance(val, tuple) else (val,)
+                        except Exception:
+                            continue
+            return results
+
+    async def _get_decimals(self, chain, token_addr):
+        key = f"{chain}:{token_addr}"
+        if key in self._decimals_cache:
+            return self._decimals_cache[key]
+        self._setup(chain)
+        w3 = self._w3[chain]
+        if not w3:
+            return 18
+        try:
+            contract = w3.eth.contract(address=AsyncWeb3.to_checksum_address(token_addr), abi=ERC20_DECIMALS_ABI)
+            dec = await contract.functions.decimals().call()
+            self._decimals_cache[key] = dec
+            return dec
+        except Exception:
+            return 18
+
+    async def fetch_reserves_for_token(self, token: TokenState):
+        if time.time() - token.last_reserve_fetch < RESERVE_TTL:
+            return
+        v2_pools = [p for p in token.pools if p["pool_type"] == "v2"]
+        if not v2_pools:
+            return
+        chain = token.chain
+        pool_addresses = [p["pool_address"] for p in v2_pools if p["pool_address"]]
+
+        res_map = await self._batch_call(chain, pool_addresses, "getReserves", V2_RESERVES_ABI, ["uint112","uint112","uint32"])
+        t0_map = await self._batch_call(chain, pool_addresses, "token0", V2_TOKEN0_ABI, ["address"])
+        t1_map = await self._batch_call(chain, pool_addresses, "token1", V2_TOKEN1_ABI, ["address"])
+
+        base_dec = await self._get_decimals(chain, token.contract)
+        quote_dec = 6
+        token.base_decimals = base_dec
+        token.quote_decimals = quote_dec
+
+        for p in v2_pools:
+            addr = p["pool_address"]
+            if addr not in res_map or addr not in t0_map or addr not in t1_map:
+                continue
+            r0, r1, _ = res_map[addr]
+            token0 = t0_map[addr][0] if isinstance(t0_map[addr], tuple) else t0_map[addr]
+            token1 = t1_map[addr][0] if isinstance(t1_map[addr], tuple) else t1_map[addr]
+            p["token0"] = token0
+            p["token1"] = token1
+            p["reserve0"] = r0
+            p["reserve1"] = r1
+
+            if token0.lower() == token.contract.lower():
+                p["r_base"] = r0 / (10**base_dec)
+                p["r_quote"] = r1 / (10**quote_dec)
+            elif token1.lower() == token.contract.lower():
+                p["r_base"] = r1 / (10**base_dec)
+                p["r_quote"] = r0 / (10**quote_dec)
+            else:
+                continue
+
+            dex_name = p["dex"].split("-")[0].lower()
+            p["fee_bps"] = DEX_FEES.get(dex_name, 30)
+
+        token.last_reserve_fetch = time.time()
 
 
 # =============================================================================
@@ -247,12 +600,13 @@ class TelegramNotifier:
 
 
 # =============================================================================
-# DISCOVERY ENGINE (relaxed, with debug prints)
+# DISCOVERY ENGINE (V2 only, strengthened filters)
 # =============================================================================
 
 class DiscoveryEngine:
-    def __init__(self, session: SafeSession):
+    def __init__(self, session: SafeSession, oc: OnChainValidator):
         self.session = session
+        self.oc = oc
 
     @staticmethod
     def _pf(val, default=0.0):
@@ -299,6 +653,11 @@ class DiscoveryEngine:
             qt = tok_map.get(quot_id, {})
             if not bt.get("address") or not qt.get("address"):
                 continue
+            if qt.get("symbol", "").upper() not in {"USDC", "USDT"}:
+                continue
+            pool_type = "v3" if dex_id in V3_DEX_IDS else "v2"
+            if pool_type != "v2":
+                continue
             results.append({
                 "chainId": chain,
                 "baseToken": {"address": bt["address"], "symbol": bt.get("symbol", "")},
@@ -308,6 +667,9 @@ class DiscoveryEngine:
                 "volume": {"h24": self._pf((attrs.get("volume_usd") or {}).get("h24"))},
                 "dexId": dex_id,
                 "pairAddress": attrs.get("address", ""),
+                "timestamp": time.time(),
+                "reserve0": 0, "reserve1": 0, "token0": "", "token1": "",
+                "pool_type": pool_type,
             })
         return results
 
@@ -335,17 +697,25 @@ class DiscoveryEngine:
             qt = p.get("quoteToken", {})
             baddr = (bt.get("address") or "").lower().strip()
             qaddr = (qt.get("address") or "").lower().strip()
+            qsym = (qt.get("symbol") or "").upper()
             if "_" in baddr and not baddr.startswith("0x"):
                 baddr = baddr.split("_", 1)[1]
             if "_" in qaddr and not qaddr.startswith("0x"):
                 qaddr = qaddr.split("_", 1)[1]
             if not baddr or not qaddr or baddr == "0x0000000000000000000000000000000000000000":
                 continue
+            if qsym not in {"USDC", "USDT"}:
+                continue
             liq_raw = p.get("liquidity", {})
             liq = self._pf(liq_raw.get("usd") if isinstance(liq_raw, dict) else liq_raw)
             vol_raw = p.get("volume", {})
             vol = self._pf(vol_raw.get("h24") if isinstance(vol_raw, dict) else vol_raw)
-            if liq < MIN_LIQUIDITY or liq > MAX_LIQUIDITY:
+            # Strengthened filters
+            if liq < DISCOVERY_MIN_LIQUIDITY:
+                continue
+            if vol < DISCOVERY_MIN_VOLUME:
+                continue
+            if vol / liq < MIN_VOLUME_LIQ_RATIO:
                 continue
             key = f"{chain}:{baddr}"
             if key not in token_map:
@@ -357,14 +727,22 @@ class DiscoveryEngine:
                     "total_liquidity": 0.0,
                     "total_volume_24h": 0.0
                 }
-            ptype = "v3" if p.get("dexId", "") in V3_DEX_IDS else "v2"
+            ptype = p.get("pool_type", "v3" if p.get("dexId", "") in V3_DEX_IDS else "v2")
+            if ptype != "v2":
+                continue
             token_map[key]["pools"].append({
                 "dex": p.get("dexId", "unknown"),
                 "price": self._pf(p.get("priceUsd")),
                 "liquidity": liq,
                 "volume_24h": vol,
                 "pool_address": (p.get("pairAddress") or "").lower(),
-                "pool_type": ptype
+                "pool_type": ptype,
+                "quote_symbol": qsym,
+                "timestamp": p.get("timestamp", time.time()),
+                "reserve0": p.get("reserve0", 0),
+                "reserve1": p.get("reserve1", 0),
+                "token0": p.get("token0", ""),
+                "token1": p.get("token1", ""),
             })
             token_map[key]["total_liquidity"] += liq
             token_map[key]["total_volume_24h"] += vol
@@ -372,24 +750,9 @@ class DiscoveryEngine:
         active_tokens = []
         for key, info in token_map.items():
             if len(info["pools"]) < MIN_POOLS or len(info["pools"]) > MAX_POOLS:
-                print(f"Filtered (pools): {info['symbol']} | pools={len(info['pools'])}")
                 continue
             if info["total_liquidity"] < MIN_LIQUIDITY or info["total_liquidity"] > MAX_LIQUIDITY:
-                print(f"Filtered (liq): {info['symbol']} | liq={info['total_liquidity']:.0f}")
                 continue
-            vol_liq = info["total_volume_24h"] / max(1, info["total_liquidity"])
-            if vol_liq < MIN_VOLUME_LIQ_RATIO:
-                print(f"Filtered (vol/liq): {info['symbol']} | ratio={vol_liq:.2f}")
-                continue
-            if any(p["price"] <= 0 for p in info["pools"]):
-                print(f"Filtered (price): {info['symbol']} | zero price")
-                continue
-
-            sym = info["symbol"].upper()
-            if sym in STABLECOIN_SYMBOLS or sym in {"WETH", "USDC", "USDT", "SOL", "UNI", "WBTC"}:
-                print(f"Filtered (stable/top): {sym}")
-                continue
-
             state = TokenState(
                 token_key=key,
                 chain=info["chain"],
@@ -399,16 +762,9 @@ class DiscoveryEngine:
                 liquidity_total=info["total_liquidity"],
                 volume_24h=info["total_volume_24h"]
             )
-
-            # Optional CEX price (Binance) – not critical, so we don't filter if missing
-            cex = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
-            if cex and "price" in cex:
-                state.cex_price = float(cex["price"])
-
-            # Compute profit potential for debugging, but do NOT filter on it
+            await self.oc.fetch_reserves_for_token(state)
             state.compute_spreads_and_profit()
-            print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.profit_potential:.2f}")
-
+            print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.max_real_profit:.2f}")
             active_tokens.append(state)
 
         print(f"  FINAL accepted pairs (will be observed): {len(active_tokens)}")
@@ -416,13 +772,85 @@ class DiscoveryEngine:
 
 
 # =============================================================================
-# STATE ENGINE
+# STATE ENGINE (SQLite logging)
 # =============================================================================
 
 class StateEngine:
-    def __init__(self):
+    def __init__(self, db_path: str = "arbitrage.db"):
         self.tokens: Dict[str, TokenState] = {}
         self.lock = asyncio.Lock()
+        self.db_path = db_path
+
+    async def init_db(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS token_memory (
+                    token_key TEXT PRIMARY KEY,
+                    opportunity_count INTEGER,
+                    avg_spread REAL,
+                    max_spread REAL,
+                    avg_duration REAL,
+                    spread_std REAL,
+                    successful_cycles INTEGER,
+                    failed_cycles INTEGER,
+                    competition_score INTEGER,
+                    behavior_type TEXT,
+                    last_seen REAL,
+                    last_spike_time REAL,
+                    spike_frequency INTEGER,
+                    avg_spike_interval REAL,
+                    recovery_time_avg REAL,
+                    spread_decay_rate REAL,
+                    fake_breakouts INTEGER,
+                    real_breakouts INTEGER,
+                    best_trade_size REAL,
+                    profit_per_trade_avg REAL,
+                    time_of_day_histogram TEXT,
+                    missed_opportunities INTEGER,
+                    decay_avg REAL,
+                    alpha_token INTEGER
+                )""")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS opportunity_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_key TEXT,
+                    timestamp REAL,
+                    spread REAL,
+                    duration REAL,
+                    liquidity REAL,
+                    profit REAL,
+                    trade_size REAL,
+                    successful INTEGER
+                )""")
+            await db.commit()
+
+    async def save_memory(self, mem: TokenMemory):
+        async with aiosqlite.connect(self.db_path) as db:
+            import json
+            hist_json = json.dumps(mem.time_of_day_histogram)
+            await db.execute("""
+                INSERT OR REPLACE INTO token_memory VALUES
+                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (mem.key, mem.opportunity_count, mem.avg_spread, mem.max_spread,
+                  mem.avg_duration, mem.spread_std, mem.successful_cycles,
+                  mem.failed_cycles, mem.competition_score, mem.behavior_type,
+                  mem.last_seen, mem.last_spike_time, mem.spike_frequency,
+                  mem.avg_spike_interval, mem.recovery_time_avg, mem.spread_decay_rate,
+                  mem.fake_breakouts, mem.real_breakouts, mem.best_trade_size,
+                  mem.profit_per_trade_avg, hist_json, mem.missed_opportunities,
+                  mem.decay_avg, 1 if mem.alpha_token else 0))
+            await db.commit()
+
+    async def log_opportunity(self, token_key: str, spread: float, duration: float,
+                               liquidity: float, profit: float, trade_size: float,
+                               successful: bool):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO opportunity_log
+                (token_key, timestamp, spread, duration, liquidity, profit, trade_size, successful)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (token_key, time.time(), spread, duration, liquidity, profit, trade_size, 1 if successful else 0))
+            await db.commit()
 
     async def update_token(self, token_key: str, chain: str, contract: str, pools: List[Dict], symbol: str = "", cex_price: float = None):
         async with self.lock:
@@ -443,7 +871,7 @@ class StateEngine:
 
 
 # =============================================================================
-# RANKING ENGINE (now allows tokens with minimal history)
+# RANKING ENGINE
 # =============================================================================
 
 class RankingEngine:
@@ -454,30 +882,42 @@ class RankingEngine:
         tokens = await self.state_engine.get_all_tokens()
         scored = []
         for token in tokens:
-            # Only require at least 1 opportunity (not 3)
-            if token.memory.opportunity_count < MIN_OPPORTUNITY_COUNT:
+            if token.blacklisted:
                 continue
-            # Profit potential threshold is now only used for ranking, not for filtering
-            # We still sort by it, but we don't drop below threshold.
-            # However, we keep the threshold as a lower bound for Telegram reports.
-            scored.append((token.profit_potential, token))
+            mem = token.memory
+            if mem.opportunity_count < MIN_OPPORTUNITY_COUNT:
+                continue
+            liq_score = min(1.0, token.liquidity_total / 200000)
+            volatility_penalty = min(1.0, mem.spread_std * 10)
+            score = (token.max_real_profit * 0.4
+                     + mem.compute_repeatability_score() * 0.2
+                     + min(mem.avg_duration / 10, 1) * 0.15
+                     + liq_score * 0.15
+                     - volatility_penalty * 0.1)
+            scored.append((score, token))
         scored.sort(key=lambda x: x[0], reverse=True)
-        # Return all tokens (not just TOP_N_PAIRS) for observation, but limit ranking output
+        top_20 = scored[:max(1, len(scored)//5)]
+        for _, token in top_20:
+            token.memory.alpha_token = True
+            await self.state_engine.save_memory(token.memory)
         return [token for _, token in scored[:TOP_N_PAIRS]]
 
 
 # =============================================================================
-# OBSERVATION ENGINE
+# OBSERVATION ENGINE (with active_opportunity linkage)
 # =============================================================================
 
 class ObservationEngine:
-    def __init__(self, session: SafeSession, state_engine: StateEngine, tg: TelegramNotifier):
+    def __init__(self, session: SafeSession, state_engine: StateEngine, tg: TelegramNotifier, oc: OnChainValidator):
         self.session = session
         self.state_engine = state_engine
         self.tg = tg
+        self.oc = oc
         self.running = False
         self.active_opps = {}
         self._sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        self.last_loop_time = time.time()
+        self.decay_tracker: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
     async def start(self):
         self.running = True
@@ -487,10 +927,21 @@ class ObservationEngine:
         while self.running:
             start = time.time()
             tokens = await self.state_engine.get_all_tokens()
+            tasks = []
+            for t in tokens:
+                if t.blacklisted:
+                    continue
+                if t.memory.alpha_token:
+                    interval = HOT_INTERVAL
+                else:
+                    interval = NORMAL_INTERVAL
+                tasks.append(self._update_token(t))
             async with self._sem:
-                await asyncio.gather(*[self._update_token(t) for t in tokens], return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
             elapsed = time.time() - start
-            await asyncio.sleep(max(0.0, OBSERVE_INTERVAL - elapsed))
+            if elapsed > LATENCY_THRESHOLD:
+                print(f"⚠️ Loop took {elapsed:.2f}s – we are late")
+            await asyncio.sleep(max(0.0, NORMAL_INTERVAL - elapsed))
 
     async def _update_token(self, token: TokenState):
         raw = await self.session.get(DEXSCREENER_TOKEN_URL.format(token.contract), "dexscreener")
@@ -500,95 +951,203 @@ class ObservationEngine:
         for p in raw.get("pairs", []):
             if p.get("chainId") != token.chain:
                 continue
+            qt = p.get("quoteToken", {})
+            qsym = (qt.get("symbol") or "").upper()
+            if qsym not in {"USDC", "USDT"}:
+                continue
             price = float(p.get("priceUsd", 0))
             liq_raw = p.get("liquidity", {})
             liquidity = float(liq_raw.get("usd", 0)) if isinstance(liq_raw, dict) else float(liq_raw) if liq_raw else 0
+            if liquidity < MIN_POOL_LIQUIDITY:
+                continue
             vol_raw = p.get("volume", {})
             volume_24h = float(vol_raw.get("h24", 0)) if isinstance(vol_raw, dict) else float(vol_raw) if vol_raw else 0
+            if volume_24h / liquidity < MIN_VOLUME_LIQ_RATIO:
+                continue
             dex = p.get("dexId", "unknown")
+            pool_addr = p.get("pairAddress", "").lower()
+            pool_type = "v3" if dex in V3_DEX_IDS else "v2"
+            if pool_type != "v2":
+                continue
             new_pools.append({
                 "dex": dex,
                 "price": price,
                 "liquidity": liquidity,
                 "volume_24h": volume_24h,
-                "pool_address": p.get("pairAddress", ""),
-                "pool_type": "v3" if dex in V3_DEX_IDS else "v2"
+                "pool_address": pool_addr,
+                "pool_type": pool_type,
+                "quote_symbol": qsym,
+                "timestamp": time.time(),
+                "reserve0": 0,
+                "reserve1": 0,
+                "token0": "",
+                "token1": "",
             })
         token.update_from_pools(new_pools)
-
-        # Optional CEX refresh (non‑critical)
-        sym = token.symbol.upper().split()[0].split("/")[0]
-        cex_data = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
-        if cex_data and "price" in cex_data:
-            token.cex_price = float(cex_data["price"])
-
+        await self.oc.fetch_reserves_for_token(token)
         token.compute_spreads_and_profit()
-        print(f"  OBSERVE {token.symbol} ({token.chain}) | spread={token.dex_spread*100:.2f}% | profit_pot=${token.profit_potential:.1f}")
-
         spread = token.dex_spread
-        if spread > MIN_AVG_SPREAD:
+        profit = token.max_real_profit
+        print(f"  OBSERVE {token.symbol} ({token.chain}) | spread={spread*100:.2f}% | profit=${profit:.2f} | alpha={token.memory.alpha_token}")
+
+        token.memory.last_5_spreads.append(spread)
+
+        if spread > MIN_AVG_SPREAD and token.liquidity_total > MIN_LIQUIDITY_TARGET:
             if token.key not in self.active_opps:
-                self.active_opps[token.key] = {"start": time.time(), "max_spread": spread}
+                # Create opportunity dict and link to token
+                opp = {"start": time.time(), "max_spread": spread}
+                self.active_opps[token.key] = opp
+                token.active_opportunity = opp
             else:
-                self.active_opps[token.key]["max_spread"] = max(self.active_opps[token.key]["max_spread"], spread)
+                opp = self.active_opps[token.key]
+                opp["max_spread"] = max(opp["max_spread"], spread)
         else:
             if token.key in self.active_opps:
-                ao = self.active_opps.pop(token.key)
-                duration = time.time() - ao["start"]
-                token.memory.update(ao["max_spread"], duration)
+                opp = self.active_opps.pop(token.key)
+                duration = time.time() - opp["start"]
+                # Update competition score
+                if profit > 0:
+                    token.memory.competition_score += 0.1
+                else:
+                    token.memory.competition_score *= 0.95
+                token.memory.competition_score = min(10, token.memory.competition_score)
+
+                token.memory.update(opp["max_spread"], duration, trade_usd=0, net_profit=profit)
                 token.memory.real_breakouts += 1
+                await self.state_engine.log_opportunity(token.key, opp["max_spread"], duration,
+                                                          token.liquidity_total, profit, token.optimal_trade_size, True)
+                self.decay_tracker[token.key].append(profit)
+                if len(self.decay_tracker[token.key]) == 5:
+                    avg_decay = sum(self.decay_tracker[token.key]) / 5
+                    if avg_decay < 0.1:
+                        token.memory.decay_avg = (token.memory.decay_avg * (token.memory.opportunity_count-1) + avg_decay) / token.memory.opportunity_count
+                        if token.memory.decay_avg < OPPORTUNITY_DECAY_THRESHOLD:
+                            token.memory.behavior_type = "FAST_DECAY"
+                            token.memory.alpha_token = False
+                            await self.state_engine.save_memory(token.memory)
+                await self.state_engine.save_memory(token.memory)
+                token.active_opportunity = None
+
+                if token.memory.failed_cycles > 5 and token.memory.successful_cycles < 2:
+                    token.blacklisted = True
+                    await self.tg.send(f"💀 *Blacklisted* {token.symbol} ({token.chain})", key=f"blacklist_{token.key}", cooldown=3600)
 
 
 # =============================================================================
-# MICRO-DOMINATION
+# MICRO-DOMINATION (with active_opportunity linkage)
 # =============================================================================
 
 class MicroDomination:
-    def __init__(self, state_engine: StateEngine, session: SafeSession, tg: TelegramNotifier):
+    def __init__(self, state_engine: StateEngine, session: SafeSession, tg: TelegramNotifier, oc: OnChainValidator):
         self.state_engine = state_engine
         self.session = session
         self.tg = tg
+        self.oc = oc
         self.running = False
         self.tasks = {}
+        self.burst_threshold = 0.005
 
     async def start(self):
         self.running = True
 
     async def watch_token(self, token_key: str):
+        last_spread = 0.0
+        last_time = time.time()
         while self.running:
             token = self.state_engine.tokens.get(token_key)
-            if not token or token.profit_potential < MIN_PROFIT_POTENTIAL_USD:
+            if not token or token.blacklisted or token.max_real_profit < MIN_PROFIT_POTENTIAL_USD:
                 break
             raw = await self.session.get(DEXSCREENER_TOKEN_URL.format(token.contract), "dexscreener")
             if not raw:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
                 continue
             new_pools = []
             for p in raw.get("pairs", []):
                 if p.get("chainId") != token.chain:
                     continue
+                qt = p.get("quoteToken", {})
+                qsym = (qt.get("symbol") or "").upper()
+                if qsym not in {"USDC", "USDT"}:
+                    continue
                 price = float(p.get("priceUsd", 0))
                 liq_raw = p.get("liquidity", {})
                 liquidity = float(liq_raw.get("usd", 0)) if isinstance(liq_raw, dict) else float(liq_raw) if liq_raw else 0
+                if liquidity < MIN_POOL_LIQUIDITY:
+                    continue
                 vol_raw = p.get("volume", {})
                 volume_24h = float(vol_raw.get("h24", 0)) if isinstance(vol_raw, dict) else float(vol_raw) if vol_raw else 0
+                if volume_24h / liquidity < MIN_VOLUME_LIQ_RATIO:
+                    continue
                 dex = p.get("dexId", "unknown")
+                pool_type = "v3" if dex in V3_DEX_IDS else "v2"
+                if pool_type != "v2":
+                    continue
                 new_pools.append({
                     "dex": dex,
                     "price": price,
                     "liquidity": liquidity,
                     "volume_24h": volume_24h,
                     "pool_address": p.get("pairAddress", ""),
-                    "pool_type": "v3" if dex in V3_DEX_IDS else "v2"
+                    "pool_type": pool_type,
+                    "quote_symbol": qsym,
+                    "timestamp": time.time(),
+                    "reserve0": 0,
+                    "reserve1": 0,
+                    "token0": "",
+                    "token1": "",
                 })
             token.update_from_pools(new_pools)
+            await self.oc.fetch_reserves_for_token(token)
             token.compute_spreads_and_profit()
-            if token.profit_potential < MIN_PROFIT_POTENTIAL_USD:
-                break
-            await asyncio.sleep(0.5)
+            spread = token.dex_spread
+            profit = token.max_real_profit
+
+            now = time.time()
+            if spread > last_spread + self.burst_threshold and (now - last_time) < BURST_DETECTION_WINDOW:
+                print(f"🚀 BURST DETECTED: {token.symbol} spread jumped {spread*100:.2f}% in {(now-last_time):.1f}s")
+                if profit >= 2.0 and spread > MIN_AVG_SPREAD:
+                    await self.tg.send(f"⚠️ *BURST* {token.symbol} spread {spread*100:.1f}%", key=f"burst_{token.key}", cooldown=30)
+            last_spread = spread
+            last_time = now
+
+            # Final gate with realistic success probability
+            if (profit >= 2.0 and spread >= MIN_AVG_SPREAD and token.liquidity_total > 50000 and
+                token.active_opportunity and (time.time() - token.active_opportunity["start"]) > 2.0):
+                # Success probability model: 60% baseline failure + competition
+                base_failure = 0.6
+                competition_factor = min(0.3, token.memory.competition_score * 0.05)
+                success_prob = max(0.05, 1 - (base_failure + competition_factor))
+                if random.random() < success_prob:
+                    token.memory.successful_cycles += 1
+                    msg = (f"⚡ *EXECUTION READY* ({token.chain})\n"
+                           f"{token.symbol}\n"
+                           f"Spread: {spread*100:.2f}%\n"
+                           f"Profit: ${profit:.2f}\n"
+                           f"Size: ${token.optimal_trade_size:.0f}\n"
+                           f"Liq: ${token.liquidity_total:,.0f}")
+                    await self.tg.send(msg, key=token.key, cooldown=60)
+                    await self.state_engine.log_opportunity(token.key, spread,
+                                                              time.time() - token.active_opportunity["start"],
+                                                              token.liquidity_total, profit, token.optimal_trade_size, True)
+                else:
+                    token.memory.failed_cycles += 1
+                    token.memory.missed_opportunities += 1
+                    await self.state_engine.log_opportunity(token.key, spread,
+                                                              time.time() - token.active_opportunity["start"],
+                                                              token.liquidity_total, profit, token.optimal_trade_size, False)
+                await self.state_engine.save_memory(token.memory)
+
+                # Blacklist if too many failures
+                if token.memory.failed_cycles > 5 and token.memory.successful_cycles < 2:
+                    token.blacklisted = True
+                    await self.tg.send(f"💀 *Blacklisted* {token.symbol} ({token.chain})", key=f"blacklist_{token.key}", cooldown=3600)
+
+            if token.memory.alpha_token:
+                await asyncio.sleep(HOT_INTERVAL)
+            else:
+                await asyncio.sleep(NORMAL_INTERVAL)
 
     async def update_targets(self, top_tokens: List[TokenState]):
-        # Do not filter again; we keep the same list as ranking output
         for key in list(self.tasks.keys()):
             if key not in [t.key for t in top_tokens]:
                 self.tasks[key].cancel()
@@ -605,6 +1164,7 @@ class MicroDomination:
 class ArbitrageScanner:
     def __init__(self):
         self.session = SafeSession()
+        self.oc = OnChainValidator()
         self.state_engine = StateEngine()
         self.tg = None
         self.obs = None
@@ -616,24 +1176,25 @@ class ArbitrageScanner:
         self.running = True
         await self.session.start()
         self.tg = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, self.session)
+        await self.state_engine.init_db()
 
-        discovery = DiscoveryEngine(self.session)
+        discovery = DiscoveryEngine(self.session, self.oc)
         tokens = await discovery.discover_tokens()
         for t in tokens:
             await self.state_engine.update_token(t.key, t.chain, t.contract, t.pools, t.symbol)
 
-        sorted_tokens = sorted(tokens, key=lambda x: x.profit_potential, reverse=True)
+        sorted_tokens = sorted(tokens, key=lambda x: x.max_real_profit, reverse=True)
         print(f"\n📋 DISCOVERED — {len(sorted_tokens)} tokens will be observed")
         for i, t in enumerate(sorted_tokens[:15], 1):
             print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
-                  f"spread={t.dex_spread*100:.2f}% | profit_pot=${t.profit_potential:.1f}")
+                  f"spread={t.dex_spread*100:.2f}% | profit=${t.max_real_profit:.2f}")
         await self.tg.send(f"Discovered {len(tokens)} tokens (observation started)", key="discovery", cooldown=3600)
 
-        self.obs = ObservationEngine(self.session, self.state_engine, self.tg)
+        self.obs = ObservationEngine(self.session, self.state_engine, self.tg, self.oc)
         await self.obs.start()
         print("👁️  Observation started.")
 
-        self.micro = MicroDomination(self.state_engine, self.session, self.tg)
+        self.micro = MicroDomination(self.state_engine, self.session, self.tg, self.oc)
         await self.micro.start()
         print("🚀 Micro‑domination ready.")
 
@@ -647,11 +1208,11 @@ class ArbitrageScanner:
             if top:
                 print(f"\n🏆 TOP {len(top)} PAIRS BY PROFIT POTENTIAL:")
                 for i, t in enumerate(top, 1):
-                    print(f"{i:2d}. {t.symbol:12} ({t.chain}) | profit=${t.profit_potential:.1f} | spread={t.dex_spread*100:.2f}% | liq=${t.liquidity_total:,.0f}")
+                    print(f"{i:2d}. {t.symbol:12} ({t.chain}) | profit=${t.max_real_profit:.1f} | spread={t.dex_spread*100:.2f}% | liq=${t.liquidity_total:,.0f}")
                 await self.micro.update_targets(top)
                 top_text = "🏆 *TOP PROFIT POTENTIAL*\n"
                 for t in top[:5]:
-                    top_text += f"{t.symbol} ({t.chain}) | ${t.profit_potential:.1f} | {t.dex_spread*100:.2f}%\n"
+                    top_text += f"{t.symbol} ({t.chain}) | ${t.max_real_profit:.1f} | {t.dex_spread*100:.2f}%\n"
                 await self.tg.send(top_text, key="top_pairs", cooldown=300)
                 summary = f"📊 *SUMMARY*\nPairs tracked: {len(await self.state_engine.get_all_tokens())}\nActive watchers: {len(self.micro.tasks)}"
                 await self.tg.send(summary, key="summary", cooldown=600)
