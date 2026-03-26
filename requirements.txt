@@ -3,3 +3,4 @@ aiosqlite
 web3
 eth-abi
 nest_asyncio
+python-dotenv
