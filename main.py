@@ -446,7 +446,7 @@ class TokenState:
             if net_profit > best_profit:
                 best_profit = net_profit
                 best_size = size_usd
-
+# modified
         if best_profit < 0.5:
             self.max_real_profit = 0.0
             self.profit_potential = 0.0
