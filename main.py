@@ -13,13 +13,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =============================================================================
-# CONFIGURATION (PROFIT-FOCUSED)
+# CONFIGURATION (RELAXED)
 # =============================================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TARGET_CHAINS = None
 EVM_CHAINS = {
     "base":     {"rpc": "https://mainnet.base.org",         "gecko": "base"},
     "arbitrum": {"rpc": "https://arb1.arbitrum.io/rpc",     "gecko": "arbitrum"},
@@ -42,17 +41,18 @@ V3_DEX_IDS = {
 STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD",
                       "FRAX", "LUSD", "USDD", "GUSD", "USDP"}
 
-MIN_LIQUIDITY             = 20_000
-MAX_LIQUIDITY             = 500_000
-MIN_VOLUME_LIQ_RATIO      = 2.0
+# --- RELAXED FILTERS ---
+MIN_LIQUIDITY             = 10_000        # was 20k
+MAX_LIQUIDITY             = 2_000_000     # was 500k
+MIN_VOLUME_LIQ_RATIO      = 0.5           # was 2.0
 MIN_POOLS                 = 2
-MAX_POOLS                 = 4
-MIN_OPPORTUNITY_COUNT     = 3
-MIN_AVG_SPREAD            = 0.008
-MIN_AVG_DURATION          = 2.5
+MAX_POOLS                 = 10            # was 4
+MIN_OPPORTUNITY_COUNT     = 1             # was 3
+MIN_AVG_SPREAD            = 0.005         # 0.5% – lower to catch small opportunities
+MIN_AVG_DURATION          = 1.5           # was 2.5
 MIN_LIQUIDITY_TARGET      = 30_000
 TOP_N_PAIRS               = 8
-MIN_PROFIT_POTENTIAL_USD  = 8.0
+MIN_PROFIT_POTENTIAL_USD  = 1.0           # was 8.0 – we'll let observation decide later
 MAX_SLIPPAGE_IMPACT       = 0.018
 FLASHLOAN_FEE_BPS         = 9
 GAS_COST_USD              = 0.5
@@ -163,16 +163,14 @@ class TokenState:
         else:
             self.dex_spread = 0.0
 
-        if self.cex_price > 0 and prices:
-            all_p = prices + [self.cex_price]
-            mn, mx = min(all_p), max(all_p)
-            total_spread = (mx - mn) / mn if mn > 0 else 0.0
-        else:
-            total_spread = self.dex_spread
+        # Use only DEX spread for profit (CEX is optional)
+        total_spread = self.dex_spread
 
+        # Realistic trade size: 0.3% of liquidity (not 2%)
+        usable_liquidity = self.liquidity_total * 0.003
         repeatability = self.memory.compute_repeatability_score() if self.memory.opportunity_count > 0 else 0.3
         slippage_adjust = 1.0 - MAX_SLIPPAGE_IMPACT
-        gross = total_spread * self.liquidity_total * 0.02 * slippage_adjust
+        gross = total_spread * usable_liquidity * slippage_adjust
         net = gross - GAS_COST_USD - (gross * FLASHLOAN_FEE_BPS / 10000)
         self.profit_potential = max(0.0, net)
 
@@ -249,7 +247,7 @@ class TelegramNotifier:
 
 
 # =============================================================================
-# DISCOVERY ENGINE
+# DISCOVERY ENGINE (relaxed, with debug prints)
 # =============================================================================
 
 class DiscoveryEngine:
@@ -374,17 +372,22 @@ class DiscoveryEngine:
         active_tokens = []
         for key, info in token_map.items():
             if len(info["pools"]) < MIN_POOLS or len(info["pools"]) > MAX_POOLS:
+                print(f"Filtered (pools): {info['symbol']} | pools={len(info['pools'])}")
                 continue
             if info["total_liquidity"] < MIN_LIQUIDITY or info["total_liquidity"] > MAX_LIQUIDITY:
+                print(f"Filtered (liq): {info['symbol']} | liq={info['total_liquidity']:.0f}")
                 continue
             vol_liq = info["total_volume_24h"] / max(1, info["total_liquidity"])
             if vol_liq < MIN_VOLUME_LIQ_RATIO:
+                print(f"Filtered (vol/liq): {info['symbol']} | ratio={vol_liq:.2f}")
                 continue
             if any(p["price"] <= 0 for p in info["pools"]):
+                print(f"Filtered (price): {info['symbol']} | zero price")
                 continue
 
             sym = info["symbol"].upper()
             if sym in STABLECOIN_SYMBOLS or sym in {"WETH", "USDC", "USDT", "SOL", "UNI", "WBTC"}:
+                print(f"Filtered (stable/top): {sym}")
                 continue
 
             state = TokenState(
@@ -397,16 +400,18 @@ class DiscoveryEngine:
                 volume_24h=info["total_volume_24h"]
             )
 
-            # CEX price fetch
+            # Optional CEX price (Binance) – not critical, so we don't filter if missing
             cex = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
             if cex and "price" in cex:
                 state.cex_price = float(cex["price"])
+
+            # Compute profit potential for debugging, but do NOT filter on it
             state.compute_spreads_and_profit()
+            print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.profit_potential:.2f}")
 
-            if state.profit_potential >= MIN_PROFIT_POTENTIAL_USD:
-                active_tokens.append(state)
+            active_tokens.append(state)
 
-        print(f"  FINAL low-competition profit-promising pairs: {len(active_tokens)}")
+        print(f"  FINAL accepted pairs (will be observed): {len(active_tokens)}")
         return active_tokens
 
 
@@ -438,7 +443,7 @@ class StateEngine:
 
 
 # =============================================================================
-# RANKING ENGINE
+# RANKING ENGINE (now allows tokens with minimal history)
 # =============================================================================
 
 class RankingEngine:
@@ -449,12 +454,15 @@ class RankingEngine:
         tokens = await self.state_engine.get_all_tokens()
         scored = []
         for token in tokens:
+            # Only require at least 1 opportunity (not 3)
             if token.memory.opportunity_count < MIN_OPPORTUNITY_COUNT:
                 continue
-            if token.profit_potential < MIN_PROFIT_POTENTIAL_USD:
-                continue
+            # Profit potential threshold is now only used for ranking, not for filtering
+            # We still sort by it, but we don't drop below threshold.
+            # However, we keep the threshold as a lower bound for Telegram reports.
             scored.append((token.profit_potential, token))
         scored.sort(key=lambda x: x[0], reverse=True)
+        # Return all tokens (not just TOP_N_PAIRS) for observation, but limit ranking output
         return [token for _, token in scored[:TOP_N_PAIRS]]
 
 
@@ -508,6 +516,7 @@ class ObservationEngine:
             })
         token.update_from_pools(new_pools)
 
+        # Optional CEX refresh (non‑critical)
         sym = token.symbol.upper().split()[0].split("/")[0]
         cex_data = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
         if cex_data and "price" in cex_data:
@@ -579,7 +588,7 @@ class MicroDomination:
             await asyncio.sleep(0.5)
 
     async def update_targets(self, top_tokens: List[TokenState]):
-        top_tokens = [t for t in top_tokens if t.profit_potential >= MIN_PROFIT_POTENTIAL_USD]
+        # Do not filter again; we keep the same list as ranking output
         for key in list(self.tasks.keys()):
             if key not in [t.key for t in top_tokens]:
                 self.tasks[key].cancel()
@@ -614,11 +623,11 @@ class ArbitrageScanner:
             await self.state_engine.update_token(t.key, t.chain, t.contract, t.pools, t.symbol)
 
         sorted_tokens = sorted(tokens, key=lambda x: x.profit_potential, reverse=True)
-        print(f"\n📋 PROFIT-PROMISING SHORTLIST — {len(sorted_tokens)} pairs")
+        print(f"\n📋 DISCOVERED — {len(sorted_tokens)} tokens will be observed")
         for i, t in enumerate(sorted_tokens[:15], 1):
             print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
-                  f"spread={t.dex_spread*100:.2f}% | **profit_potential=${t.profit_potential:.1f}**")
-        await self.tg.send(f"Discovered {len(tokens)} profit-promising pairs", key="discovery", cooldown=3600)
+                  f"spread={t.dex_spread*100:.2f}% | profit_pot=${t.profit_potential:.1f}")
+        await self.tg.send(f"Discovered {len(tokens)} tokens (observation started)", key="discovery", cooldown=3600)
 
         self.obs = ObservationEngine(self.session, self.state_engine, self.tg)
         await self.obs.start()
@@ -647,7 +656,7 @@ class ArbitrageScanner:
                 summary = f"📊 *SUMMARY*\nPairs tracked: {len(await self.state_engine.get_all_tokens())}\nActive watchers: {len(self.micro.tasks)}"
                 await self.tg.send(summary, key="summary", cooldown=600)
             else:
-                print("⚠️  No pairs with sufficient history yet.")
+                print("⚠️  No tokens with sufficient history yet.")
             await asyncio.sleep(interval)
 
     async def _heartbeat(self, interval=15):
@@ -670,7 +679,6 @@ async def main():
     scanner = ArbitrageScanner()
     try:
         await scanner.start()
-        # Keep running until interrupted
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
