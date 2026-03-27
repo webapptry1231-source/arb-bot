@@ -473,7 +473,13 @@ def compute_spreads_and_profit(self):
             if addr:
                 self.pool_timestamps[addr] = p.get("timestamp", time.time())
 
-
+# Hotfix: if compute_spreads_and_profit was accidentally pasted at module level,
+# bind it back to TokenState so scanner does not crash.
+if not hasattr(TokenState, "compute_spreads_and_profit"):
+    fn = globals().get("compute_spreads_and_profit")
+    if callable(fn):
+        TokenState.compute_spreads_and_profit = fn
+        print("HOTFIX: rebound module-level compute_spreads_and_profit to TokenState")
 # =============================================================================
 # ON-CHAIN VALIDATOR (Multicall3)
 # =============================================================================
