@@ -1,4 +1,3 @@
-
 import asyncio
 import aiohttp
 import time
@@ -471,15 +470,19 @@ class OnChainValidator:
         for p in v2_pools:
             addr = p["pool_address"]
             if addr in t0_map:
-                t0 = t0_map[addr][0] if isinstance(t0_map[addr], tuple) else t0_map[addr]
-                if t0.lower() != token.contract.lower():
-                    quote_token_addr = t0
-                    break
+                t0_raw = t0_map[addr]
+                if isinstance(t0_raw, (tuple, list)) and len(t0_raw) > 0:
+                    t0 = t0_raw[0]
+                    if t0.lower() != token.contract.lower():
+                        quote_token_addr = t0
+                        break
             if addr in t1_map and not quote_token_addr:
-                t1 = t1_map[addr][0] if isinstance(t1_map[addr], tuple) else t1_map[addr]
-                if t1.lower() != token.contract.lower():
-                    quote_token_addr = t1
-                    break
+                t1_raw = t1_map[addr]
+                if isinstance(t1_raw, (tuple, list)) and len(t1_raw) > 0:
+                    t1 = t1_raw[0]
+                    if t1.lower() != token.contract.lower():
+                        quote_token_addr = t1
+                        break
 
         base_dec = await self._get_decimals(chain, token.contract)
         quote_dec = 6
@@ -490,11 +493,24 @@ class OnChainValidator:
 
         for p in v2_pools:
             addr = p["pool_address"]
+            # Validate that we have data for this pool
             if addr not in res_map or addr not in t0_map or addr not in t1_map:
                 continue
-            r0, r1, _ = res_map[addr]
-            token0 = t0_map[addr][0] if isinstance(t0_map[addr], tuple) else t0_map[addr]
-            token1 = t1_map[addr][0] if isinstance(t1_map[addr], tuple) else t1_map[addr]
+            # Guard against malformed reserve data
+            reserves = res_map[addr]
+            if not isinstance(reserves, (tuple, list)) or len(reserves) < 3:
+                continue
+            r0, r1, _ = reserves
+            # Guard against malformed token0/token1 data
+            t0_raw = t0_map[addr]
+            t1_raw = t1_map[addr]
+            if not isinstance(t0_raw, (tuple, list)) or not isinstance(t1_raw, (tuple, list)):
+                continue
+            if len(t0_raw) < 1 or len(t1_raw) < 1:
+                continue
+            token0 = t0_raw[0]
+            token1 = t1_raw[0]
+
             p["token0"] = token0
             p["token1"] = token1
             p["reserve0"] = r0
