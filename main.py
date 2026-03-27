@@ -284,184 +284,182 @@ class TokenState:
         self.blacklisted = False
         self.confidence_score = 0.0
 
-    def compute_spreads_and_profit(self):
-        # Always compute from current reserves; if none, result will be zero
-        now = time.time()
-        valid_pools = []
+def compute_spreads_and_profit(self):
+    now = time.time()
+    valid_pools = []
 
-        for p in self.pools:
-            if p.get("pool_type") != "v2":
-                continue
+    for p in self.pools:
+        if p.get("pool_type") != "v2":
+            continue
 
-            quote = p.get("quote_symbol", "").upper()
-            if quote not in ALLOWED_QUOTE_SYMBOLS:
-                continue
+        quote = p.get("quote_symbol", "").upper()
+        if quote not in ALLOWED_QUOTE_SYMBOLS:
+            continue
 
-            quote_usd = p.get("quote_usd", 0.0)
-            if quote in STABLECOIN_SYMBOLS:
-                quote_usd = 1.0
-            elif not (QUOTE_USD_MIN <= quote_usd <= QUOTE_USD_MAX):
-                continue
+        quote_usd = p.get("quote_usd", 0.0)
+        if quote in STABLECOIN_SYMBOLS:
+            quote_usd = 1.0
+        elif not (QUOTE_USD_MIN <= quote_usd <= QUOTE_USD_MAX):
+            continue
 
-            if "timestamp" in p and now - p["timestamp"] > MAX_POOL_AGE:
-                continue
-            if p.get("price", 0) <= 0:
-                continue
+        if "timestamp" in p and now - p["timestamp"] > MAX_POOL_AGE:
+            continue
+        if p.get("price", 0) <= 0:
+            continue
 
-            addr = p.get("pool_address", "")
-            if addr:
-                if addr not in self.price_history:
-                    self.price_history[addr] = deque(maxlen=2)
-                self.price_history[addr].append(p["price"])
-                if len(self.price_history[addr]) == 2:
-                    old, new = self.price_history[addr]
-                    jump = (new - old) / old if old > 0 else 0
-                    if abs(jump) > MAX_PRICE_JUMP_PCT:
-                        continue
-
-            if "r_base" not in p or "r_quote" not in p:
-                continue
-            if not is_healthy_pool(p):
-                continue
-
-            valid_pools.append(p)
-
-        if len(valid_pools) < 2:
-            self.dex_spread = 0.0
-            self.max_real_profit = 0.0
-            self.profit_potential = 0.0
-            self.confidence_score = 0.0
-            return
-
-        prices = []
-        for p in valid_pools:
-            price = p["r_quote"] / p["r_base"] if p["r_base"] > 0 else 0.0
-            if price <= 0:
-                continue
-            prices.append(price)
-
-        if not prices:
-            self.dex_spread = 0.0
-            self.confidence_score = 0.0
-            return
-
-        mn, mx = min(prices), max(prices)
-        if mn == 0:
-            self.dex_spread = 0.0
-            self.confidence_score = 0.0
-            return
-
-        raw_spread = (mx - mn) / mn
-        if raw_spread > 0.03:
-            self.dex_spread = 0.0
-            self.confidence_score = 0.0
-            return
-        if raw_spread < 0.001:
-            self.dex_spread = 0.0
-            self.confidence_score = 0.0
-            return
-
-        self.dex_spread = raw_spread
-
-        # Confidence score for downstream execution routing
-        avg_age = sum(max(0.0, now - p.get("timestamp", now)) for p in valid_pools) / len(valid_pools)
-        freshness = max(0.0, min(1.0, 1 - (avg_age / MAX_POOL_AGE)))
-        pool_depth = min(1.0, len(valid_pools) / 4)
-        liquidity = min(1.0, self.liquidity_total / 100_000)
-        spread_quality = max(0.0, min(1.0, (raw_spread - 0.001) / 0.02))
-        quote_quality_count = 0
-        for p in valid_pools:
-            qsym = p.get("quote_symbol", "").upper()
-            qusd = p.get("quote_usd", 0.0)
-            if qsym in STABLECOIN_SYMBOLS:
-                quote_quality_count += 1
-            elif QUOTE_USD_MIN <= qusd <= QUOTE_USD_MAX:
-                quote_quality_count += 1
-        quote_quality = quote_quality_count / len(valid_pools)
-
-        self.confidence_score = max(0.0, min(1.0, (
-            freshness * 0.3
-            + pool_depth * 0.2
-            + liquidity * 0.2
-            + spread_quality * 0.15
-            + quote_quality * 0.15
-        )))
-
-        cheapest = min(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
-        most_expensive = max(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
-
-        min_pool_liq_usd = min(cheapest["r_quote"], most_expensive["r_quote"])
-        max_size_usd = min_pool_liq_usd * 0.02
-        test_sizes = [max_size_usd * f for f in [0.1, 0.25, 0.5, 0.75, 1.0]]
-
-        best_profit = 0.0
-        best_size = 0
-        gas_cost = GAS_COST_CHAIN.get(self.chain, 0.5) * GAS_MULTIPLIER
-        competition_penalty = 1 - min(0.5, self.memory.competition_score * 0.05)
-        latency_factor = CHAIN_LATENCY.get(self.chain, 0.5)
-        latency_penalty = 1 - min(0.5, latency_factor * 0.8)
-        difficulty = CHAIN_DIFFICULTY.get(self.chain, 2)
-        difficulty_penalty = 1 - min(0.5, difficulty * 0.1)
-
-        # Fixed latency decay (chain-based, not random)
-        execution_delay = latency_factor
-        decay_factor = max(0.6, 1 - execution_delay * 0.3)
-
-        for size_usd in test_sizes:
-            if size_usd > min_pool_liq_usd * 0.02:
-                continue
-
-            amount_base = get_amount_out(
-                size_usd,
-                cheapest["r_quote"],
-                cheapest["r_base"],
-                cheapest["fee_bps"]
-            )
-            if amount_base <= 0:
-                continue
-
-            amount_quote_out = get_amount_out(
-                amount_base,
-                most_expensive["r_base"],
-                most_expensive["r_quote"],
-                most_expensive["fee_bps"]
-            )
-            if amount_quote_out <= 0:
-                continue
-
-            effective_price = size_usd / amount_base if amount_base > 0 else 0
-            market_price = cheapest["r_quote"] / cheapest["r_base"] if cheapest["r_base"] > 0 else 0
-            if market_price > 0:
-                buy_impact = abs(effective_price - market_price) / market_price
-                if buy_impact > MAX_SLIPPAGE_IMPACT:
+        addr = p.get("pool_address", "")
+        if addr:
+            if addr not in self.price_history:
+                self.price_history[addr] = deque(maxlen=2)
+            self.price_history[addr].append(p["price"])
+            if len(self.price_history[addr]) == 2:
+                old, new = self.price_history[addr]
+                jump = (new - old) / old if old > 0 else 0
+                if abs(jump) > MAX_PRICE_JUMP_PCT:
                     continue
 
-            sell_price = amount_quote_out / amount_base if amount_base > 0 else 0
-            expected_sell_price = most_expensive["r_quote"] / most_expensive["r_base"] if most_expensive["r_base"] > 0 else 0
-            if expected_sell_price > 0:
-                sell_impact = abs(sell_price - expected_sell_price) / expected_sell_price
-                if sell_impact > MAX_SLIPPAGE_IMPACT:
-                    continue
+        if "r_base" not in p or "r_quote" not in p:
+            continue
+        if not is_healthy_pool(p):
+            continue
 
-            profit_usd = amount_quote_out - size_usd
-            flash_fee = size_usd * FLASHLOAN_FEE_BPS / 10000
-            net_profit = profit_usd - gas_cost - flash_fee
-            net_profit *= competition_penalty * latency_penalty * difficulty_penalty * decay_factor
-            net_profit *= 0.75   # MEV penalty
+        valid_pools.append(p)
 
-            if net_profit > best_profit:
-                best_profit = net_profit
-                best_size = size_usd
+    if len(valid_pools) < 2:
+        self.dex_spread = 0.0
+        self.max_real_profit = 0.0
+        self.profit_potential = 0.0
+        self.confidence_score = 0.0
+        return
 
-        if best_profit < 0.5:
-            self.max_real_profit = 0.0
-            self.profit_potential = 0.0
-            self.optimal_trade_size = 0.0
-            return
+    prices = []
+    for p in valid_pools:
+        price = p["r_quote"] / p["r_base"] if p["r_base"] > 0 else 0.0
+        if price <= 0:
+            continue
+        prices.append(price)
 
-        self.max_real_profit = best_profit
-        self.profit_potential = best_profit
-        self.optimal_trade_size = best_size
+    if not prices:
+        self.dex_spread = 0.0
+        self.confidence_score = 0.0
+        return
+
+    mn, mx = min(prices), max(prices)
+    if mn == 0:
+        self.dex_spread = 0.0
+        self.confidence_score = 0.0
+        return
+
+    raw_spread = (mx - mn) / mn
+    if raw_spread > 0.03 or raw_spread < 0.001:
+        self.dex_spread = 0.0
+        self.confidence_score = 0.0
+        return
+
+    self.dex_spread = raw_spread
+
+    # confidence score
+    avg_age = sum(max(0.0, now - p.get("timestamp", now)) for p in valid_pools) / len(valid_pools)
+    freshness = max(0.0, min(1.0, 1 - (avg_age / MAX_POOL_AGE)))
+    pool_depth = min(1.0, len(valid_pools) / 4)
+    liquidity = min(1.0, self.liquidity_total / 100_000)
+    spread_quality = max(0.0, min(1.0, (raw_spread - 0.001) / 0.02))
+
+    quote_quality_count = 0
+    for p in valid_pools:
+        qsym = p.get("quote_symbol", "").upper()
+        qusd = p.get("quote_usd", 0.0)
+        if qsym in STABLECOIN_SYMBOLS:
+            quote_quality_count += 1
+        elif QUOTE_USD_MIN <= qusd <= QUOTE_USD_MAX:
+            quote_quality_count += 1
+
+    quote_quality = quote_quality_count / len(valid_pools)
+    self.confidence_score = max(0.0, min(1.0, (
+        freshness * 0.3 +
+        pool_depth * 0.2 +
+        liquidity * 0.2 +
+        spread_quality * 0.15 +
+        quote_quality * 0.15
+    )))
+
+    cheapest = min(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
+    most_expensive = max(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
+
+    min_pool_liq_usd = min(cheapest["r_quote"], most_expensive["r_quote"])
+    max_size_usd = min_pool_liq_usd * 0.02
+    test_sizes = [max_size_usd * f for f in [0.1, 0.25, 0.5, 0.75, 1.0]]
+
+    best_profit = 0.0
+    best_size = 0.0
+
+    gas_cost = GAS_COST_CHAIN.get(self.chain, 0.5) * GAS_MULTIPLIER
+    competition_penalty = 1 - min(0.5, self.memory.competition_score * 0.05)
+    latency_factor = CHAIN_LATENCY.get(self.chain, 0.5)
+    latency_penalty = 1 - min(0.5, latency_factor * 0.8)
+    difficulty = CHAIN_DIFFICULTY.get(self.chain, 2)
+    difficulty_penalty = 1 - min(0.5, difficulty * 0.1)
+
+    execution_delay = latency_factor
+    decay_factor = max(0.6, 1 - execution_delay * 0.3)
+
+    for size_usd in test_sizes:
+        if size_usd <= 0:
+            continue
+        if size_usd > min_pool_liq_usd * 0.02:
+            continue
+
+        amount_base = get_amount_out(
+            size_usd,
+            cheapest["r_quote"],
+            cheapest["r_base"],
+            cheapest["fee_bps"]
+        )
+        if amount_base <= 0:
+            continue
+
+        amount_quote_out = get_amount_out(
+            amount_base,
+            most_expensive["r_base"],
+            most_expensive["r_quote"],
+            most_expensive["fee_bps"]
+        )
+        if amount_quote_out <= 0:
+            continue
+
+        effective_price = size_usd / amount_base if amount_base > 0 else 0
+        market_price = cheapest["r_quote"] / cheapest["r_base"] if cheapest["r_base"] > 0 else 0
+        if market_price > 0:
+            buy_impact = abs(effective_price - market_price) / market_price
+            if buy_impact > MAX_SLIPPAGE_IMPACT:
+                continue
+
+        sell_price = amount_quote_out / amount_base if amount_base > 0 else 0
+        expected_sell_price = most_expensive["r_quote"] / most_expensive["r_base"] if most_expensive["r_base"] > 0 else 0
+        if expected_sell_price > 0:
+            sell_impact = abs(sell_price - expected_sell_price) / expected_sell_price
+            if sell_impact > MAX_SLIPPAGE_IMPACT:
+                continue
+
+        profit_usd = amount_quote_out - size_usd
+        flash_fee = size_usd * FLASHLOAN_FEE_BPS / 10000
+        net_profit = profit_usd - gas_cost - flash_fee
+        net_profit *= competition_penalty * latency_penalty * difficulty_penalty * decay_factor
+        net_profit *= 0.75  # MEV penalty
+
+        if net_profit > best_profit:
+            best_profit = net_profit
+            best_size = size_usd
+
+    if best_profit < 0.5:
+        self.max_real_profit = 0.0
+        self.profit_potential = 0.0
+        self.optimal_trade_size = 0.0
+        return
+
+    self.max_real_profit = best_profit
+    self.profit_potential = best_profit
+    self.optimal_trade_size = best_size
 
             profit_usd = amount_quote_out - size_usd
             flash_fee = size_usd * FLASHLOAN_FEE_BPS / 10000
