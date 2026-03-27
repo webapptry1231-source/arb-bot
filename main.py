@@ -17,6 +17,7 @@ load_dotenv()
 
 # =============================================================================
 # CONFIGURATION
+# CONFIGURATION (RELAXED)
 # =============================================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -84,6 +85,27 @@ MIN_AVG_DURATION          = 1.5
 MIN_LIQUIDITY_TARGET      = 30_000
 TOP_N_PAIRS               = 8
 MIN_PROFIT_POTENTIAL_USD  = 1.0
+MIN_POOLS                 = 2
+MAX_POOLS                 = 10
+MIN_OPPORTUNITY_COUNT     = 1
+MIN_AVG_SPREAD            = 0.003
+MIN_AVG_DURATION          = 1.5
+MIN_LIQUIDITY_TARGET      = 30_000
+TOP_N_PAIRS               = 8
+MIN_PROFIT_POTENTIAL_USD  = 1.0
+
+# --- RELAXED FILTERS ---
+MIN_LIQUIDITY             = 10_000        # was 20k
+MAX_LIQUIDITY             = 2_000_000     # was 500k
+MIN_VOLUME_LIQ_RATIO      = 0.5           # was 2.0
+MIN_POOLS                 = 2
+MAX_POOLS                 = 10            # was 4
+MIN_OPPORTUNITY_COUNT     = 1             # was 3
+MIN_AVG_SPREAD            = 0.005         # 0.5% – lower to catch small opportunities
+MIN_AVG_DURATION          = 1.5           # was 2.5
+MIN_LIQUIDITY_TARGET      = 30_000
+TOP_N_PAIRS               = 8
+MIN_PROFIT_POTENTIAL_USD  = 1.0           # was 8.0 – we'll let observation decide later
 MAX_SLIPPAGE_IMPACT       = 0.018
 FLASHLOAN_FEE_BPS         = 9
 MIN_CONFIDENCE_SCORE      = 0.55
@@ -91,6 +113,19 @@ MIN_CONFIDENCE_SCORE      = 0.55
 DISCOVERY_MIN_VOLUME      = 5_000
 DISCOVERY_MIN_LIQUIDITY   = 20_000
 MIN_POOL_LIQUIDITY        = 20_000
+
+# Reserve freshness: fetch every 5 seconds (aligns with observation interval)
+RESERVE_TTL = 5
+
+MAX_POOL_AGE              = 60
+MAX_PRICE_JUMP_PCT        = 0.05
+
+CHAIN_DIFFICULTY = {
+    "base": 1, "polygon": 1, "optimism": 2, "arbitrum": 3, "bsc": 3, "ethereum": 4,
+}
+LATENCY_THRESHOLD = 2.0
+OPPORTUNITY_DECAY_THRESHOLD = 1.0
+
 
 # Reserve freshness: fetch every 5 seconds (aligns with observation interval)
 RESERVE_TTL = 5
@@ -259,6 +294,17 @@ class TokenState:
             quote = p.get("quote_symbol", "").upper()
             if quote not in {"USDC", "USDT"}:
                 continue
+
+            quote = p.get("quote_symbol", "").upper()
+            if quote not in ALLOWED_QUOTE_SYMBOLS:
+                continue
+
+            quote_usd = p.get("quote_usd", 0.0)
+            if quote in STABLECOIN_SYMBOLS:
+                quote_usd = 1.0
+            elif not (QUOTE_USD_MIN <= quote_usd <= QUOTE_USD_MAX):
+                continue
+
             if "timestamp" in p and now - p["timestamp"] > MAX_POOL_AGE:
                 continue
             if p.get("price", 0) <= 0:
@@ -411,6 +457,34 @@ class TokenState:
         self.profit_potential = best_profit
         self.optimal_trade_size = best_size
 
+            profit_usd = amount_quote_out - size_usd
+            flash_fee = size_usd * FLASHLOAN_FEE_BPS / 10000
+            net_profit = profit_usd - gas_cost - flash_fee
+            net_profit *= competition_penalty * latency_penalty * difficulty_penalty * decay_factor
+            net_profit *= 0.75   # MEV penalty
+
+            if net_profit > best_profit:
+                best_profit = net_profit
+                best_size = size_usd
+
+        if best_profit < 0.5:
+            self.max_real_profit = 0.0
+            self.optimal_trade_size = 0.0
+            return
+
+        self.max_real_profit = best_profit
+        self.optimal_trade_size = best_size
+        # Use only DEX spread for profit (CEX is optional)
+        total_spread = self.dex_spread
+
+        # Realistic trade size: 0.3% of liquidity (not 2%)
+        usable_liquidity = self.liquidity_total * 0.003
+        repeatability = self.memory.compute_repeatability_score() if self.memory.opportunity_count > 0 else 0.3
+        slippage_adjust = 1.0 - MAX_SLIPPAGE_IMPACT
+        gross = total_spread * usable_liquidity * slippage_adjust
+        net = gross - GAS_COST_USD - (gross * FLASHLOAN_FEE_BPS / 10000)
+        self.profit_potential = max(0.0, net)
+
     def update_from_pools(self, new_pools: List[Dict]):
         self.pools = new_pools
         self.liquidity_total = sum(p["liquidity"] for p in new_pools)
@@ -420,6 +494,248 @@ class TokenState:
             addr = p.get("pool_address", "")
             if addr:
                 self.pool_timestamps[addr] = p.get("timestamp", time.time())
+
+
+# =============================================================================
+# ON-CHAIN VALIDATOR (Multicall3)
+# =============================================================================
+
+MULTICALL3_ABI = [{"inputs":[{"components":[{"name":"target","type":"address"},{"name":"callData","type":"bytes"}],"name":"calls","type":"tuple[]"}],"name":"aggregate","outputs":[{"name":"blockNumber","type":"uint256"},{"name":"returnData","type":"bytes[]"}],"stateMutability":"payable","type":"function"}]
+V2_RESERVES_ABI = [{"inputs":[],"name":"getReserves","outputs":[{"name":"_reserve0","type":"uint112"},{"name":"_reserve1","type":"uint112"},{"name":"_blockTimestampLast","type":"uint32"}],"stateMutability":"view","type":"function"}]
+V2_TOKEN0_ABI = [{"inputs":[],"name":"token0","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}]
+V2_TOKEN1_ABI = [{"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}]
+ERC20_DECIMALS_ABI = [{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]
+
+class OnChainValidator:
+    def __init__(self):
+        self._w3 = {}
+        self._mc = {}
+        self._decimals_cache = {}
+        self._sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        self._rpc_index = defaultdict(int)
+        self._active_rpc = {}
+        self._rpc_stats = defaultdict(lambda: defaultdict(lambda: {"ok": 0, "fail": 0, "lat_ms": 500.0, "last_fail": 0.0}))
+
+    def _pick_best_rpc(self, chain: str, rpcs: List[str]) -> str:
+        now = time.time()
+        best_rpc = rpcs[0]
+        best_score = float("-inf")
+        for rpc in rpcs:
+            st = self._rpc_stats[chain][rpc]
+            success = st["ok"]
+            fail = st["fail"]
+            total = success + fail
+            success_rate = success / total if total else 0.7
+            recent_fail_penalty = 0.2 if (now - st["last_fail"]) < 30 else 0.0
+            latency_score = max(0.0, 1 - min(st["lat_ms"], 2000.0) / 2000.0)
+            score = (success_rate * 0.65) + (latency_score * 0.35) - recent_fail_penalty
+            if score > best_score:
+                best_score = score
+                best_rpc = rpc
+        return best_rpc
+
+    def _record_rpc_result(self, chain: str, rpc: str, ok: bool, latency_ms: float = None):
+        st = self._rpc_stats[chain][rpc]
+        if ok:
+            st["ok"] += 1
+            if latency_ms is not None:
+                st["lat_ms"] = st["lat_ms"] * 0.7 + latency_ms * 0.3
+        else:
+            st["fail"] += 1
+            st["last_fail"] = time.time()
+
+    def _setup(self, chain, rotate: bool = False):
+        rpcs = chain_rpcs(chain)
+        if not rpcs:
+            return
+        if chain in self._w3 and not rotate:
+            return
+        if rotate and chain in self._active_rpc and len(rpcs) > 1:
+            current = self._active_rpc[chain]
+            self._rpc_index[chain] = (rpcs.index(current) + 1) % len(rpcs) if current in rpcs else 0
+            rpc = rpcs[self._rpc_index[chain]]
+        else:
+            rpc = self._pick_best_rpc(chain, rpcs)
+        w3 = AsyncWeb3(AsyncHTTPProvider(rpc, request_kwargs={"timeout":5}))
+        self._w3[chain] = w3
+        self._mc[chain] = w3.eth.contract(address=AsyncWeb3.to_checksum_address(MULTICALL3_ADDR), abi=MULTICALL3_ABI)
+        self._active_rpc[chain] = rpc
+
+    async def _batch_call(self, chain, targets, fn_name, abi, decode_types):
+        async with self._sem:
+            self._setup(chain)
+            w3, mc = self._w3.get(chain), self._mc.get(chain)
+            if not w3 or not mc:
+                return {}
+            calls = []
+            valid_targets = []
+            for target in targets:
+                if not target:
+                    continue
+                try:
+                    c = w3.eth.contract(address=AsyncWeb3.to_checksum_address(target), abi=abi)
+                    calls.append((AsyncWeb3.to_checksum_address(target), c.encode_abi(fn_name)))
+                    valid_targets.append(target)
+                except Exception:
+                    continue
+            if not calls:
+                return {}
+            from eth_abi import decode as abi_decode
+            results = {}
+            BATCH = 25
+            for i in range(0, len(calls), BATCH):
+                b_calls, b_targets = calls[i:i+BATCH], valid_targets[i:i+BATCH]
+                try:
+                    t0 = time.time()
+                    _, rd = await mc.functions.aggregate(b_calls).call()
+                    active_rpc = self._active_rpc.get(chain, "")
+                    if active_rpc:
+                        self._record_rpc_result(chain, active_rpc, ok=True, latency_ms=(time.time() - t0) * 1000)
+                    for j, data in enumerate(rd):
+                        try:
+                            decoded = abi_decode(decode_types, data)
+                            results[b_targets[j]] = decoded
+                        except Exception:
+                            continue
+                except Exception:
+                    active_rpc = self._active_rpc.get(chain, "")
+                    if active_rpc:
+                        self._record_rpc_result(chain, active_rpc, ok=False)
+                    # RPC may be stale/rate-limited; rotate provider and retry this batch once
+                    self._setup(chain, rotate=True)
+                    w3, mc = self._w3.get(chain), self._mc.get(chain)
+                    if not w3 or not mc:
+                        continue
+                    for j, (target, _) in enumerate(b_calls):
+                        try:
+                            c = w3.eth.contract(address=target, abi=abi)
+                            val = await getattr(c.functions, fn_name)().call()
+                            results[b_targets[j]] = val if isinstance(val, tuple) else (val,)
+                        except Exception:
+                            continue
+            return results
+
+    async def _get_decimals(self, chain, token_addr):
+        key = f"{chain}:{token_addr}"
+        if key in self._decimals_cache:
+            return self._decimals_cache[key]
+        self._setup(chain)
+        w3 = self._w3.get(chain)
+        if not w3:
+            return 18
+        try:
+            t0 = time.time()
+            contract = w3.eth.contract(address=AsyncWeb3.to_checksum_address(token_addr), abi=ERC20_DECIMALS_ABI)
+            dec = await contract.functions.decimals().call()
+            active_rpc = self._active_rpc.get(chain, "")
+            if active_rpc:
+                self._record_rpc_result(chain, active_rpc, ok=True, latency_ms=(time.time() - t0) * 1000)
+            self._decimals_cache[key] = dec
+            return dec
+        except Exception:
+            active_rpc = self._active_rpc.get(chain, "")
+            if active_rpc:
+                self._record_rpc_result(chain, active_rpc, ok=False)
+            # Retry once on next configured RPC for this chain
+            try:
+                self._setup(chain, rotate=True)
+                w3 = self._w3.get(chain)
+                if not w3:
+                    return 18
+                t0 = time.time()
+                contract = w3.eth.contract(address=AsyncWeb3.to_checksum_address(token_addr), abi=ERC20_DECIMALS_ABI)
+                dec = await contract.functions.decimals().call()
+                active_rpc = self._active_rpc.get(chain, "")
+                if active_rpc:
+                    self._record_rpc_result(chain, active_rpc, ok=True, latency_ms=(time.time() - t0) * 1000)
+                self._decimals_cache[key] = dec
+                return dec
+            except Exception:
+                active_rpc = self._active_rpc.get(chain, "")
+                if active_rpc:
+                    self._record_rpc_result(chain, active_rpc, ok=False)
+                return 18
+
+    async def fetch_reserves_for_token(self, token: TokenState):
+        if time.time() - token.last_reserve_fetch < RESERVE_TTL:
+            return
+        v2_pools = [p for p in token.pools if p["pool_type"] == "v2"]
+        if not v2_pools:
+            return
+        chain = token.chain
+        pool_addresses = [p["pool_address"] for p in v2_pools if p["pool_address"]]
+
+        res_map = await self._batch_call(chain, pool_addresses, "getReserves", V2_RESERVES_ABI, ["uint112","uint112","uint32"])
+        t0_map = await self._batch_call(chain, pool_addresses, "token0", V2_TOKEN0_ABI, ["address"])
+        t1_map = await self._batch_call(chain, pool_addresses, "token1", V2_TOKEN1_ABI, ["address"])
+
+        # Determine quote token address (the token that is not the base)
+        quote_token_addr = None
+        for p in v2_pools:
+            addr = p["pool_address"]
+            if addr in t0_map:
+                t0_raw = t0_map[addr]
+                if isinstance(t0_raw, (tuple, list)) and len(t0_raw) > 0:
+                    t0 = t0_raw[0]
+                    if t0.lower() != token.contract.lower():
+                        quote_token_addr = t0
+                        break
+            if addr in t1_map and not quote_token_addr:
+                t1_raw = t1_map[addr]
+                if isinstance(t1_raw, (tuple, list)) and len(t1_raw) > 0:
+                    t1 = t1_raw[0]
+                    if t1.lower() != token.contract.lower():
+                        quote_token_addr = t1
+                        break
+
+        base_dec = await self._get_decimals(chain, token.contract)
+        quote_dec = 6
+        if quote_token_addr:
+            quote_dec = await self._get_decimals(chain, quote_token_addr)
+        token.base_decimals = base_dec
+        token.quote_decimals = quote_dec
+
+        for p in v2_pools:
+            addr = p["pool_address"]
+            # Validate that we have data for this pool
+            if addr not in res_map or addr not in t0_map or addr not in t1_map:
+                continue
+            # Guard against malformed reserve data
+            reserves = res_map[addr]
+            if not isinstance(reserves, (tuple, list)) or len(reserves) < 3:
+                continue
+            r0, r1, _ = reserves
+            # Guard against malformed token0/token1 data
+            t0_raw = t0_map[addr]
+            t1_raw = t1_map[addr]
+            if not isinstance(t0_raw, (tuple, list)) or not isinstance(t1_raw, (tuple, list)):
+                continue
+            if len(t0_raw) < 1 or len(t1_raw) < 1:
+                continue
+            token0 = t0_raw[0]
+            token1 = t1_raw[0]
+
+            p["token0"] = token0
+            p["token1"] = token1
+            p["reserve0"] = r0
+            p["reserve1"] = r1
+
+            if token0.lower() == token.contract.lower():
+                p["r_base"] = r0 / (10**base_dec)
+                p["r_quote"] = (r1 / (10**quote_dec)) * max(p.get("quote_usd", 0), 0)
+            elif token1.lower() == token.contract.lower():
+                p["r_base"] = r1 / (10**base_dec)
+                p["r_quote"] = (r0 / (10**quote_dec)) * max(p.get("quote_usd", 0), 0)
+            else:
+                continue
+
+            dex_name = p["dex"].split("-")[0].lower()
+            p["fee_bps"] = DEX_FEES.get(dex_name, 30)
+
+        token.last_reserve_fetch = time.time()
+
+
+# =============================================================================
 
 
 # =============================================================================
@@ -743,7 +1059,7 @@ class TelegramNotifier:
 
 
 # =============================================================================
-# DISCOVERY ENGINE
+# DISCOVERY ENGINE (relaxed, with debug prints)
 # =============================================================================
 
 class DiscoveryEngine:
@@ -944,9 +1260,24 @@ class DiscoveryEngine:
         active_tokens = []
         for key, info in token_map.items():
             if len(info["pools"]) < MIN_POOLS or len(info["pools"]) > MAX_POOLS:
+                print(f"Filtered (pools): {info['symbol']} | pools={len(info['pools'])}")
                 continue
             if info["total_liquidity"] < MIN_LIQUIDITY or info["total_liquidity"] > MAX_LIQUIDITY:
+                print(f"Filtered (liq): {info['symbol']} | liq={info['total_liquidity']:.0f}")
                 continue
+            vol_liq = info["total_volume_24h"] / max(1, info["total_liquidity"])
+            if vol_liq < MIN_VOLUME_LIQ_RATIO:
+                print(f"Filtered (vol/liq): {info['symbol']} | ratio={vol_liq:.2f}")
+                continue
+            if any(p["price"] <= 0 for p in info["pools"]):
+                print(f"Filtered (price): {info['symbol']} | zero price")
+                continue
+
+            sym = info["symbol"].upper()
+            if sym in STABLECOIN_SYMBOLS or sym in {"WETH", "USDC", "USDT", "SOL", "UNI", "WBTC"}:
+                print(f"Filtered (stable/top): {sym}")
+                continue
+
             state = TokenState(
                 token_key=key,
                 chain=info["chain"],
@@ -959,6 +1290,22 @@ class DiscoveryEngine:
             await self.oc.fetch_reserves_for_token(state)
             state.compute_spreads_and_profit()
             print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.max_real_profit:.2f}")
+            active_tokens.append(state)
+
+            state.compute_spreads_and_profit()
+            print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.max_real_profit:.2f}")
+            active_tokens.append(state)
+
+
+            # Optional CEX price (Binance) – not critical, so we don't filter if missing
+            cex = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
+            if cex and "price" in cex:
+                state.cex_price = float(cex["price"])
+
+            # Compute profit potential for debugging, but do NOT filter on it
+            state.compute_spreads_and_profit()
+            print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.profit_potential:.2f}")
+
             active_tokens.append(state)
 
         print(f"  FINAL accepted pairs (will be observed): {len(active_tokens)}")
@@ -1069,7 +1416,7 @@ class StateEngine:
 
 
 # =============================================================================
-# RANKING ENGINE
+# RANKING ENGINE (now allows tokens with minimal history)
 # =============================================================================
 
 class RankingEngine:
@@ -1102,6 +1449,20 @@ class RankingEngine:
         for _, token in top_20:
             token.memory.alpha_token = True
             await self.state_engine.save_memory(token.memory)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_20 = scored[:max(1, len(scored)//5)]
+        for _, token in top_20:
+            token.memory.alpha_token = True
+            await self.state_engine.save_memory(token.memory)
+            # Only require at least 1 opportunity (not 3)
+            if token.memory.opportunity_count < MIN_OPPORTUNITY_COUNT:
+                continue
+            # Profit potential threshold is now only used for ranking, not for filtering
+            # We still sort by it, but we don't drop below threshold.
+            # However, we keep the threshold as a lower bound for Telegram reports.
+            scored.append((token.profit_potential, token))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Return all tokens (not just TOP_N_PAIRS) for observation, but limit ranking output
         return [token for _, token in scored[:TOP_N_PAIRS]]
 
 
@@ -1143,6 +1504,11 @@ class ObservationEngine:
                 return
 
             old_pool_map = {p["pool_address"]: p for p in token.pools if "pool_address" in p}
+        # Optional CEX refresh (non‑critical)
+        sym = token.symbol.upper().split()[0].split("/")[0]
+        cex_data = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
+        if cex_data and "price" in cex_data:
+            token.cex_price = float(cex_data["price"])
 
             new_pools = []
             for p in raw.get("pairs", []):
@@ -1310,6 +1676,7 @@ class MicroDomination:
 
     async def update_targets(self, top_tokens: List[TokenState]):
         top_keys = {t.key for t in top_tokens}
+        # Do not filter again; we keep the same list as ranking output
         for key in list(self.tasks.keys()):
             task = self.tasks[key]
             if key not in top_keys or task.done():
@@ -1351,6 +1718,14 @@ class ArbitrageScanner:
         for i, t in enumerate(sorted_tokens[:15], 1):
             print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
                   f"spread={t.dex_spread*100:.2f}% | profit=${t.max_real_profit:.2f}")
+        for i, t in enumerate(sorted_tokens[:15], 1):
+            print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
+                  f"spread={t.dex_spread*100:.2f}% | profit=${t.max_real_profit:.2f}")
+        sorted_tokens = sorted(tokens, key=lambda x: x.profit_potential, reverse=True)
+        print(f"\n📋 DISCOVERED — {len(sorted_tokens)} tokens will be observed")
+        for i, t in enumerate(sorted_tokens[:15], 1):
+            print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
+                  f"spread={t.dex_spread*100:.2f}% | profit_pot=${t.profit_potential:.1f}")
         await self.tg.send(f"Discovered {len(tokens)} tokens (observation started)", key="discovery", cooldown=3600)
 
         self.obs = ObservationEngine(self.session, self.state_engine, self.tg, self.oc)
@@ -1426,6 +1801,14 @@ async def main():
             print(f"💥 Scanner crashed: {e} — restarting in 30s")
             await scanner.stop()
             await asyncio.sleep(30)
+    scanner = ArbitrageScanner()
+    try:
+        await scanner.start()
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await scanner.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
