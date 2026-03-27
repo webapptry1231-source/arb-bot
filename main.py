@@ -1787,6 +1787,11 @@ async def main():
         pass
     finally:
         await scanner.stop()
+import os, inspect
+print("DEBUG FILE:", __file__)
+print("DEBUG CWD:", os.getcwd())
+print("DEBUG has method:", hasattr(TokenState, "compute_spreads_and_profit"))
+print("DEBUG method obj:", getattr(TokenState, "compute_spreads_and_profit", None))
 
 if __name__ == "__main__":
     asyncio.run(main())
