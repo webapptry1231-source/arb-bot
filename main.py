@@ -268,9 +268,17 @@ class TokenState:
         for p in self.pools:
             if p.get("pool_type") != "v2":
                 continue
+
             quote = p.get("quote_symbol", "").upper()
-            if quote not in {"USDC", "USDT"}:
+            if quote not in ALLOWED_QUOTE_SYMBOLS:
                 continue
+
+            quote_usd = p.get("quote_usd", 0.0)
+            if quote in STABLECOIN_SYMBOLS:
+                quote_usd = 1.0
+            elif not (QUOTE_USD_MIN <= quote_usd <= QUOTE_USD_MAX):
+                continue
+
             if "timestamp" in p and now - p["timestamp"] > MAX_POOL_AGE:
                 continue
             if p.get("price", 0) <= 0:
