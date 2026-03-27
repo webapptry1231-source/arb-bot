@@ -285,6 +285,7 @@ class TokenState:
         self.confidence_score = 0.0
 
 def compute_spreads_and_profit(self):
+    # Always compute from current reserves; if none, result will be zero
     now = time.time()
     valid_pools = []
 
@@ -460,34 +461,6 @@ def compute_spreads_and_profit(self):
     self.max_real_profit = best_profit
     self.profit_potential = best_profit
     self.optimal_trade_size = best_size
-
-            profit_usd = amount_quote_out - size_usd
-            flash_fee = size_usd * FLASHLOAN_FEE_BPS / 10000
-            net_profit = profit_usd - gas_cost - flash_fee
-            net_profit *= competition_penalty * latency_penalty * difficulty_penalty * decay_factor
-            net_profit *= 0.75   # MEV penalty
-
-            if net_profit > best_profit:
-                best_profit = net_profit
-                best_size = size_usd
-
-        if best_profit < 0.5:
-            self.max_real_profit = 0.0
-            self.optimal_trade_size = 0.0
-            return
-
-        self.max_real_profit = best_profit
-        self.optimal_trade_size = best_size
-        # Use only DEX spread for profit (CEX is optional)
-        total_spread = self.dex_spread
-
-        # Realistic trade size: 0.3% of liquidity (not 2%)
-        usable_liquidity = self.liquidity_total * 0.003
-        repeatability = self.memory.compute_repeatability_score() if self.memory.opportunity_count > 0 else 0.3
-        slippage_adjust = 1.0 - MAX_SLIPPAGE_IMPACT
-        gross = total_spread * usable_liquidity * slippage_adjust
-        net = gross - GAS_COST_USD - (gross * FLASHLOAN_FEE_BPS / 10000)
-        self.profit_potential = max(0.0, net)
 
     def update_from_pools(self, new_pools: List[Dict]):
         self.pools = new_pools
