@@ -17,6 +17,7 @@ load_dotenv()
 
 # =============================================================================
 # CONFIGURATION
+# CONFIGURATION (RELAXED)
 # =============================================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -84,6 +85,19 @@ MIN_AVG_DURATION          = 1.5
 MIN_LIQUIDITY_TARGET      = 30_000
 TOP_N_PAIRS               = 8
 MIN_PROFIT_POTENTIAL_USD  = 1.0
+
+# --- RELAXED FILTERS ---
+MIN_LIQUIDITY             = 10_000        # was 20k
+MAX_LIQUIDITY             = 2_000_000     # was 500k
+MIN_VOLUME_LIQ_RATIO      = 0.5           # was 2.0
+MIN_POOLS                 = 2
+MAX_POOLS                 = 10            # was 4
+MIN_OPPORTUNITY_COUNT     = 1             # was 3
+MIN_AVG_SPREAD            = 0.005         # 0.5% – lower to catch small opportunities
+MIN_AVG_DURATION          = 1.5           # was 2.5
+MIN_LIQUIDITY_TARGET      = 30_000
+TOP_N_PAIRS               = 8
+MIN_PROFIT_POTENTIAL_USD  = 1.0           # was 8.0 – we'll let observation decide later
 MAX_SLIPPAGE_IMPACT       = 0.018
 FLASHLOAN_FEE_BPS         = 9
 MIN_CONFIDENCE_SCORE      = 0.55
@@ -405,6 +419,16 @@ class TokenState:
 
         self.max_real_profit = best_profit
         self.optimal_trade_size = best_size
+        # Use only DEX spread for profit (CEX is optional)
+        total_spread = self.dex_spread
+
+        # Realistic trade size: 0.3% of liquidity (not 2%)
+        usable_liquidity = self.liquidity_total * 0.003
+        repeatability = self.memory.compute_repeatability_score() if self.memory.opportunity_count > 0 else 0.3
+        slippage_adjust = 1.0 - MAX_SLIPPAGE_IMPACT
+        gross = total_spread * usable_liquidity * slippage_adjust
+        net = gross - GAS_COST_USD - (gross * FLASHLOAN_FEE_BPS / 10000)
+        self.profit_potential = max(0.0, net)
 
     def update_from_pools(self, new_pools: List[Dict]):
         self.pools = new_pools
@@ -738,7 +762,7 @@ class TelegramNotifier:
 
 
 # =============================================================================
-# DISCOVERY ENGINE
+# DISCOVERY ENGINE (relaxed, with debug prints)
 # =============================================================================
 
 class DiscoveryEngine:
@@ -939,9 +963,24 @@ class DiscoveryEngine:
         active_tokens = []
         for key, info in token_map.items():
             if len(info["pools"]) < MIN_POOLS or len(info["pools"]) > MAX_POOLS:
+                print(f"Filtered (pools): {info['symbol']} | pools={len(info['pools'])}")
                 continue
             if info["total_liquidity"] < MIN_LIQUIDITY or info["total_liquidity"] > MAX_LIQUIDITY:
+                print(f"Filtered (liq): {info['symbol']} | liq={info['total_liquidity']:.0f}")
                 continue
+            vol_liq = info["total_volume_24h"] / max(1, info["total_liquidity"])
+            if vol_liq < MIN_VOLUME_LIQ_RATIO:
+                print(f"Filtered (vol/liq): {info['symbol']} | ratio={vol_liq:.2f}")
+                continue
+            if any(p["price"] <= 0 for p in info["pools"]):
+                print(f"Filtered (price): {info['symbol']} | zero price")
+                continue
+
+            sym = info["symbol"].upper()
+            if sym in STABLECOIN_SYMBOLS or sym in {"WETH", "USDC", "USDT", "SOL", "UNI", "WBTC"}:
+                print(f"Filtered (stable/top): {sym}")
+                continue
+
             state = TokenState(
                 token_key=key,
                 chain=info["chain"],
@@ -954,6 +993,18 @@ class DiscoveryEngine:
             await self.oc.fetch_reserves_for_token(state)
             state.compute_spreads_and_profit()
             print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.max_real_profit:.2f}")
+            active_tokens.append(state)
+
+
+            # Optional CEX price (Binance) – not critical, so we don't filter if missing
+            cex = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
+            if cex and "price" in cex:
+                state.cex_price = float(cex["price"])
+
+            # Compute profit potential for debugging, but do NOT filter on it
+            state.compute_spreads_and_profit()
+            print(f"Accepted: {state.symbol} | liq={state.liquidity_total:.0f} | spread={state.dex_spread*100:.2f}% | profit=${state.profit_potential:.2f}")
+
             active_tokens.append(state)
 
         print(f"  FINAL accepted pairs (will be observed): {len(active_tokens)}")
@@ -1064,7 +1115,7 @@ class StateEngine:
 
 
 # =============================================================================
-# RANKING ENGINE
+# RANKING ENGINE (now allows tokens with minimal history)
 # =============================================================================
 
 class RankingEngine:
@@ -1097,6 +1148,15 @@ class RankingEngine:
         for _, token in top_20:
             token.memory.alpha_token = True
             await self.state_engine.save_memory(token.memory)
+            # Only require at least 1 opportunity (not 3)
+            if token.memory.opportunity_count < MIN_OPPORTUNITY_COUNT:
+                continue
+            # Profit potential threshold is now only used for ranking, not for filtering
+            # We still sort by it, but we don't drop below threshold.
+            # However, we keep the threshold as a lower bound for Telegram reports.
+            scored.append((token.profit_potential, token))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Return all tokens (not just TOP_N_PAIRS) for observation, but limit ranking output
         return [token for _, token in scored[:TOP_N_PAIRS]]
 
 
@@ -1138,6 +1198,11 @@ class ObservationEngine:
                 return
 
             old_pool_map = {p["pool_address"]: p for p in token.pools if "pool_address" in p}
+        # Optional CEX refresh (non‑critical)
+        sym = token.symbol.upper().split()[0].split("/")[0]
+        cex_data = await self.session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", "cex")
+        if cex_data and "price" in cex_data:
+            token.cex_price = float(cex_data["price"])
 
             new_pools = []
             for p in raw.get("pairs", []):
@@ -1305,6 +1370,7 @@ class MicroDomination:
 
     async def update_targets(self, top_tokens: List[TokenState]):
         top_keys = {t.key for t in top_tokens}
+        # Do not filter again; we keep the same list as ranking output
         for key in list(self.tasks.keys()):
             task = self.tasks[key]
             if key not in top_keys or task.done():
@@ -1346,6 +1412,11 @@ class ArbitrageScanner:
         for i, t in enumerate(sorted_tokens[:15], 1):
             print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
                   f"spread={t.dex_spread*100:.2f}% | profit=${t.max_real_profit:.2f}")
+        sorted_tokens = sorted(tokens, key=lambda x: x.profit_potential, reverse=True)
+        print(f"\n📋 DISCOVERED — {len(sorted_tokens)} tokens will be observed")
+        for i, t in enumerate(sorted_tokens[:15], 1):
+            print(f"{i:2d}. {t.symbol:12} ({t.chain}) | liq=${t.liquidity_total:,.0f} | "
+                  f"spread={t.dex_spread*100:.2f}% | profit_pot=${t.profit_potential:.1f}")
         await self.tg.send(f"Discovered {len(tokens)} tokens (observation started)", key="discovery", cooldown=3600)
 
         self.obs = ObservationEngine(self.session, self.state_engine, self.tg, self.oc)
@@ -1421,6 +1492,14 @@ async def main():
             print(f"💥 Scanner crashed: {e} — restarting in 30s")
             await scanner.stop()
             await asyncio.sleep(30)
+    scanner = ArbitrageScanner()
+    try:
+        await scanner.start()
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await scanner.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
