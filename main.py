@@ -288,11 +288,9 @@ class TokenState:
         # Always compute from current reserves; if none, result will be zero
         now = time.time()
         valid_pools = []
+
         for p in self.pools:
             if p.get("pool_type") != "v2":
-                continue
-            quote = p.get("quote_symbol", "").upper()
-            if quote not in {"USDC", "USDT"}:
                 continue
 
             quote = p.get("quote_symbol", "").upper()
@@ -309,6 +307,7 @@ class TokenState:
                 continue
             if p.get("price", 0) <= 0:
                 continue
+
             addr = p.get("pool_address", "")
             if addr:
                 if addr not in self.price_history:
@@ -319,10 +318,12 @@ class TokenState:
                     jump = (new - old) / old if old > 0 else 0
                     if abs(jump) > MAX_PRICE_JUMP_PCT:
                         continue
+
             if "r_base" not in p or "r_quote" not in p:
                 continue
             if not is_healthy_pool(p):
                 continue
+
             valid_pools.append(p)
 
         if len(valid_pools) < 2:
@@ -338,15 +339,18 @@ class TokenState:
             if price <= 0:
                 continue
             prices.append(price)
+
         if not prices:
             self.dex_spread = 0.0
             self.confidence_score = 0.0
             return
+
         mn, mx = min(prices), max(prices)
         if mn == 0:
             self.dex_spread = 0.0
             self.confidence_score = 0.0
             return
+
         raw_spread = (mx - mn) / mn
         if raw_spread > 0.03:
             self.dex_spread = 0.0
@@ -356,6 +360,7 @@ class TokenState:
             self.dex_spread = 0.0
             self.confidence_score = 0.0
             return
+
         self.dex_spread = raw_spread
 
         # Confidence score for downstream execution routing
@@ -373,6 +378,7 @@ class TokenState:
             elif QUOTE_USD_MIN <= qusd <= QUOTE_USD_MAX:
                 quote_quality_count += 1
         quote_quality = quote_quality_count / len(valid_pools)
+
         self.confidence_score = max(0.0, min(1.0, (
             freshness * 0.3
             + pool_depth * 0.2
@@ -446,7 +452,7 @@ class TokenState:
             if net_profit > best_profit:
                 best_profit = net_profit
                 best_size = size_usd
-# modified
+
         if best_profit < 0.5:
             self.max_real_profit = 0.0
             self.profit_potential = 0.0
