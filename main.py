@@ -22,6 +22,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+
 EVM_CHAINS = {
     "base":     {"rpc": "https://mainnet.base.org",         "gecko": "base"},
     "arbitrum": {"rpc": "https://arb1.arbitrum.io/rpc",     "gecko": "arbitrum"},
@@ -91,9 +92,14 @@ MIN_PROFIT_POTENTIAL_USD  = 1.0
 MAX_SLIPPAGE_IMPACT       = 0.018
 FLASHLOAN_FEE_BPS         = 9
 
+CONCURRENCY_LIMIT = 20
+RATE_LIMIT_SLEEP = 0.2
+SPREAD_HISTORY_LEN = 10
+V3_DEX_IDS = set()
+
 # Additional discovery filters (strengthened)
-DISCOVERY_MIN_VOLUME      = 20_000   # minimum 24h volume
-DISCOVERY_MIN_LIQUIDITY   = 30_000   # minimum liquidity
+DISCOVERY_MIN_VOLUME      = 10_000   # minimum 24h volume
+DISCOVERY_MIN_LIQUIDITY   = 20_000   # minimum liquidity
 
 # Reserve cache TTL (seconds)
 RESERVE_TTL = 10
