@@ -64,6 +64,7 @@ CHAIN_LATENCY = {
     "bsc": 0.4, "optimism": 0.5,
 }
 
+
 STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD",
                       "FRAX", "LUSD", "USDD", "GUSD", "USDP"}
 MAJOR_QUOTE_SYMBOLS = {"WETH", "ETH", "WBTC", "BTC", "WBNB", "BNB", "WMATIC", "MATIC"}
