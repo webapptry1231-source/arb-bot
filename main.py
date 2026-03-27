@@ -33,12 +33,12 @@ V3_DEX_IDS = {
 }
 
 EVM_CHAINS = {
-    "base":     {"rpc": "https://mainnet.base.org",         "gecko": "base"},
-    "arbitrum": {"rpc": "https://arb1.arbitrum.io/rpc",     "gecko": "arbitrum"},
-    "bsc":      {"rpc": "https://bsc-dataseed.binance.org", "gecko": "bsc"},
-    "polygon":  {"rpc": "https://polygon-rpc.com",          "gecko": "polygon_pos"},
-    "ethereum": {"rpc": "https://eth.llamarpc.com",         "gecko": "ethereum"},
-    "optimism": {"rpc": "https://mainnet.optimism.io",      "gecko": "optimism"},
+    "base":     {"rpcs": ["https://mainnet.base.org"],         "gecko": "base"},
+    "arbitrum": {"rpcs": ["https://arb1.arbitrum.io/rpc"],     "gecko": "arbitrum"},
+    "bsc":      {"rpcs": ["https://bsc-dataseed.binance.org"], "gecko": "bsc"},
+    "polygon":  {"rpcs": ["https://polygon-rpc.com"],          "gecko": "polygon_pos"},
+    "ethereum": {"rpcs": ["https://eth.llamarpc.com"],         "gecko": "ethereum"},
+    "optimism": {"rpcs": ["https://mainnet.optimism.io"],      "gecko": "optimism"},
 }
 GECKO_TO_CHAIN = {v["gecko"]: k for k, v in EVM_CHAINS.items()}
 GECKO_TO_CHAIN["polygon_pos"] = "polygon"
@@ -65,6 +65,13 @@ CHAIN_LATENCY = {
 
 STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD",
                       "FRAX", "LUSD", "USDD", "GUSD", "USDP"}
+MAJOR_QUOTE_SYMBOLS = {"WETH", "ETH", "WBTC", "BTC", "WBNB", "BNB", "WMATIC", "MATIC"}
+ALLOWED_QUOTE_SYMBOLS = STABLECOIN_SYMBOLS | MAJOR_QUOTE_SYMBOLS
+QUOTE_USD_MIN = 0.0001
+QUOTE_USD_MAX = 200_000
+# Precision mode (user chose option 2: fewer but higher-confidence candidates)
+NON_STABLE_LIQUIDITY_MULTIPLIER = 2.0
+NON_STABLE_VOLUME_MULTIPLIER = 2.0
 
 MIN_LIQUIDITY             = 10_000
 MAX_LIQUIDITY             = 20_000_000
@@ -79,6 +86,7 @@ TOP_N_PAIRS               = 8
 MIN_PROFIT_POTENTIAL_USD  = 1.0
 MAX_SLIPPAGE_IMPACT       = 0.018
 FLASHLOAN_FEE_BPS         = 9
+MIN_CONFIDENCE_SCORE      = 0.55
 
 DISCOVERY_MIN_VOLUME      = 5_000
 DISCOVERY_MIN_LIQUIDITY   = 20_000
@@ -105,6 +113,17 @@ DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={}"
 GECKO_BASE             = "https://api.geckoterminal.com/api/v2"
 
 DEXSCREENER_QUERIES = ["new", "trending", "hot", "base", "sol", "bsc", "arb", "eth", "polygon"]
+
+
+def chain_rpcs(chain: str) -> List[str]:
+    cfg = EVM_CHAINS.get(chain, {})
+    defaults = cfg.get("rpcs", [])
+    env_key = f"RPCS_{chain.upper()}"
+    env_val = os.getenv(env_key, "").strip()
+    if not env_val:
+        return defaults
+    parsed = [u.strip() for u in env_val.split(",") if u.strip()]
+    return parsed or defaults
 
 # =============================================================================
 # AMM Helpers
@@ -226,6 +245,7 @@ class TokenState:
         self.quote_decimals = 6
         self.last_reserve_fetch = 0.0
         self.blacklisted = False
+        self.confidence_score = 0.0
 
     def compute_spreads_and_profit(self):
         # Always compute from current reserves; if none, result will be zero
@@ -260,6 +280,7 @@ class TokenState:
         if len(valid_pools) < 2:
             self.dex_spread = 0.0
             self.max_real_profit = 0.0
+            self.confidence_score = 0.0
             return
 
         prices = []
@@ -270,19 +291,46 @@ class TokenState:
             prices.append(price)
         if not prices:
             self.dex_spread = 0.0
+            self.confidence_score = 0.0
             return
         mn, mx = min(prices), max(prices)
         if mn == 0:
             self.dex_spread = 0.0
+            self.confidence_score = 0.0
             return
         raw_spread = (mx - mn) / mn
         if raw_spread > 0.03:
             self.dex_spread = 0.0
+            self.confidence_score = 0.0
             return
         if raw_spread < 0.001:
             self.dex_spread = 0.0
+            self.confidence_score = 0.0
             return
         self.dex_spread = raw_spread
+
+        # Confidence score for downstream execution routing
+        avg_age = sum(max(0.0, now - p.get("timestamp", now)) for p in valid_pools) / len(valid_pools)
+        freshness = max(0.0, min(1.0, 1 - (avg_age / MAX_POOL_AGE)))
+        pool_depth = min(1.0, len(valid_pools) / 4)
+        liquidity = min(1.0, self.liquidity_total / 100_000)
+        spread_quality = max(0.0, min(1.0, (raw_spread - 0.001) / 0.02))
+        quote_quality_count = 0
+        for p in valid_pools:
+            qsym = p.get("quote_symbol", "").upper()
+            qusd = p.get("quote_usd", 0.0)
+            if qsym in STABLECOIN_SYMBOLS:
+                quote_quality_count += 1
+            elif QUOTE_USD_MIN <= qusd <= QUOTE_USD_MAX:
+                quote_quality_count += 1
+        quote_quality = quote_quality_count / len(valid_pools)
+        self.confidence_score = max(0.0, min(1.0, (
+            freshness * 0.3
+            + pool_depth * 0.2
+            + liquidity * 0.2
+            + spread_quality * 0.15
+            + quote_quality * 0.15
+        )))
 
         cheapest = min(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
         most_expensive = max(valid_pools, key=lambda x: x["r_quote"] / x["r_base"])
@@ -385,19 +433,59 @@ class OnChainValidator:
         self._mc = {}
         self._decimals_cache = {}
         self._sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        self._rpc_index = defaultdict(int)
+        self._active_rpc = {}
+        self._rpc_stats = defaultdict(lambda: defaultdict(lambda: {"ok": 0, "fail": 0, "lat_ms": 500.0, "last_fail": 0.0}))
 
-    def _setup(self, chain):
-        if chain in self._w3:
+    def _pick_best_rpc(self, chain: str, rpcs: List[str]) -> str:
+        now = time.time()
+        best_rpc = rpcs[0]
+        best_score = float("-inf")
+        for rpc in rpcs:
+            st = self._rpc_stats[chain][rpc]
+            success = st["ok"]
+            fail = st["fail"]
+            total = success + fail
+            success_rate = success / total if total else 0.7
+            recent_fail_penalty = 0.2 if (now - st["last_fail"]) < 30 else 0.0
+            latency_score = max(0.0, 1 - min(st["lat_ms"], 2000.0) / 2000.0)
+            score = (success_rate * 0.65) + (latency_score * 0.35) - recent_fail_penalty
+            if score > best_score:
+                best_score = score
+                best_rpc = rpc
+        return best_rpc
+
+    def _record_rpc_result(self, chain: str, rpc: str, ok: bool, latency_ms: float = None):
+        st = self._rpc_stats[chain][rpc]
+        if ok:
+            st["ok"] += 1
+            if latency_ms is not None:
+                st["lat_ms"] = st["lat_ms"] * 0.7 + latency_ms * 0.3
+        else:
+            st["fail"] += 1
+            st["last_fail"] = time.time()
+
+    def _setup(self, chain, rotate: bool = False):
+        rpcs = chain_rpcs(chain)
+        if not rpcs:
             return
-        rpc = EVM_CHAINS[chain]["rpc"]
+        if chain in self._w3 and not rotate:
+            return
+        if rotate and chain in self._active_rpc and len(rpcs) > 1:
+            current = self._active_rpc[chain]
+            self._rpc_index[chain] = (rpcs.index(current) + 1) % len(rpcs) if current in rpcs else 0
+            rpc = rpcs[self._rpc_index[chain]]
+        else:
+            rpc = self._pick_best_rpc(chain, rpcs)
         w3 = AsyncWeb3(AsyncHTTPProvider(rpc, request_kwargs={"timeout":5}))
         self._w3[chain] = w3
         self._mc[chain] = w3.eth.contract(address=AsyncWeb3.to_checksum_address(MULTICALL3_ADDR), abi=MULTICALL3_ABI)
+        self._active_rpc[chain] = rpc
 
     async def _batch_call(self, chain, targets, fn_name, abi, decode_types):
         async with self._sem:
             self._setup(chain)
-            w3, mc = self._w3[chain], self._mc[chain]
+            w3, mc = self._w3.get(chain), self._mc.get(chain)
             if not w3 or not mc:
                 return {}
             calls = []
@@ -419,7 +507,11 @@ class OnChainValidator:
             for i in range(0, len(calls), BATCH):
                 b_calls, b_targets = calls[i:i+BATCH], valid_targets[i:i+BATCH]
                 try:
+                    t0 = time.time()
                     _, rd = await mc.functions.aggregate(b_calls).call()
+                    active_rpc = self._active_rpc.get(chain, "")
+                    if active_rpc:
+                        self._record_rpc_result(chain, active_rpc, ok=True, latency_ms=(time.time() - t0) * 1000)
                     for j, data in enumerate(rd):
                         try:
                             decoded = abi_decode(decode_types, data)
@@ -427,6 +519,14 @@ class OnChainValidator:
                         except Exception:
                             continue
                 except Exception:
+                    active_rpc = self._active_rpc.get(chain, "")
+                    if active_rpc:
+                        self._record_rpc_result(chain, active_rpc, ok=False)
+                    # RPC may be stale/rate-limited; rotate provider and retry this batch once
+                    self._setup(chain, rotate=True)
+                    w3, mc = self._w3.get(chain), self._mc.get(chain)
+                    if not w3 or not mc:
+                        continue
                     for j, (target, _) in enumerate(b_calls):
                         try:
                             c = w3.eth.contract(address=target, abi=abi)
@@ -441,16 +541,41 @@ class OnChainValidator:
         if key in self._decimals_cache:
             return self._decimals_cache[key]
         self._setup(chain)
-        w3 = self._w3[chain]
+        w3 = self._w3.get(chain)
         if not w3:
             return 18
         try:
+            t0 = time.time()
             contract = w3.eth.contract(address=AsyncWeb3.to_checksum_address(token_addr), abi=ERC20_DECIMALS_ABI)
             dec = await contract.functions.decimals().call()
+            active_rpc = self._active_rpc.get(chain, "")
+            if active_rpc:
+                self._record_rpc_result(chain, active_rpc, ok=True, latency_ms=(time.time() - t0) * 1000)
             self._decimals_cache[key] = dec
             return dec
         except Exception:
-            return 18
+            active_rpc = self._active_rpc.get(chain, "")
+            if active_rpc:
+                self._record_rpc_result(chain, active_rpc, ok=False)
+            # Retry once on next configured RPC for this chain
+            try:
+                self._setup(chain, rotate=True)
+                w3 = self._w3.get(chain)
+                if not w3:
+                    return 18
+                t0 = time.time()
+                contract = w3.eth.contract(address=AsyncWeb3.to_checksum_address(token_addr), abi=ERC20_DECIMALS_ABI)
+                dec = await contract.functions.decimals().call()
+                active_rpc = self._active_rpc.get(chain, "")
+                if active_rpc:
+                    self._record_rpc_result(chain, active_rpc, ok=True, latency_ms=(time.time() - t0) * 1000)
+                self._decimals_cache[key] = dec
+                return dec
+            except Exception:
+                active_rpc = self._active_rpc.get(chain, "")
+                if active_rpc:
+                    self._record_rpc_result(chain, active_rpc, ok=False)
+                return 18
 
     async def fetch_reserves_for_token(self, token: TokenState):
         if time.time() - token.last_reserve_fetch < RESERVE_TTL:
@@ -518,10 +643,10 @@ class OnChainValidator:
 
             if token0.lower() == token.contract.lower():
                 p["r_base"] = r0 / (10**base_dec)
-                p["r_quote"] = r1 / (10**quote_dec)
+                p["r_quote"] = (r1 / (10**quote_dec)) * max(p.get("quote_usd", 0), 0)
             elif token1.lower() == token.contract.lower():
                 p["r_base"] = r1 / (10**base_dec)
-                p["r_quote"] = r0 / (10**quote_dec)
+                p["r_quote"] = (r0 / (10**quote_dec)) * max(p.get("quote_usd", 0), 0)
             else:
                 continue
 
@@ -592,6 +717,11 @@ class TelegramNotifier:
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
         self.last_sent = {}
 
+    @staticmethod
+    def _escape_markdown(text: str) -> str:
+        escape_chars = r"_*[]()~`>#+-=|{}.!"
+        return "".join(f"\\{c}" if c in escape_chars else c for c in str(text))
+
     async def send(self, text, key=None, cooldown=30):
         if not self.token or not self.chat_id:
             return
@@ -602,8 +732,8 @@ class TelegramNotifier:
             self.last_sent[key] = now
         await self.session.post(self.url, {
             "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
+            "text": self._escape_markdown(text),
+            "parse_mode": "MarkdownV2"
         })
 
 
@@ -622,6 +752,26 @@ class DiscoveryEngine:
             return float(val or default)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _safe_div(num: float, den: float, default: float = 0.0) -> float:
+        if den == 0:
+            return default
+        return num / den
+
+    def _quote_usd_from_pair(self, pair: Dict) -> float:
+        qt = pair.get("quoteToken", {})
+        qsym = (qt.get("symbol") or "").upper()
+        if qsym in STABLECOIN_SYMBOLS:
+            return 1.0
+        price_usd = self._pf(pair.get("priceUsd"))
+        price_native = self._pf(pair.get("priceNative"))
+        inferred = self._safe_div(price_usd, price_native)
+        return inferred if QUOTE_USD_MIN <= inferred <= QUOTE_USD_MAX else 0.0
+
+    @staticmethod
+    def _is_valid_quote_usd(quote_usd: float) -> bool:
+        return QUOTE_USD_MIN <= quote_usd <= QUOTE_USD_MAX
 
     async def _dexscreener_search(self, q: str) -> List[Dict]:
         d = await self.session.get(DEXSCREENER_SEARCH_URL.format(q), "dexscreener")
@@ -676,7 +826,14 @@ class DiscoveryEngine:
             qt = tok_map.get(quot_id, {})
             if not bt.get("address") or not qt.get("address"):
                 continue
-            if qt.get("symbol", "").upper() not in {"USDC", "USDT"}:
+            qsym = qt.get("symbol", "").upper()
+            if qsym not in ALLOWED_QUOTE_SYMBOLS:
+                continue
+            quote_usd = 1.0 if qsym in STABLECOIN_SYMBOLS else self._safe_div(
+                self._pf(attrs.get("base_token_price_usd")),
+                self._pf(attrs.get("base_token_price_quote_token"))
+            )
+            if not self._is_valid_quote_usd(quote_usd):
                 continue
             pool_type = "v3" if dex_id in V3_DEX_IDS else "v2"
             if pool_type != "v2":
@@ -686,11 +843,13 @@ class DiscoveryEngine:
                 "baseToken": {"address": bt["address"], "symbol": bt.get("symbol", "")},
                 "quoteToken": {"address": qt["address"], "symbol": qt.get("symbol", "")},
                 "priceUsd": self._pf(attrs.get("base_token_price_usd")),
+                "priceNative": self._pf(attrs.get("base_token_price_quote_token")),
                 "liquidity": {"usd": self._pf(attrs.get("reserve_in_usd"))},
                 "volume": {"h24": self._pf((attrs.get("volume_usd") or {}).get("h24"))},
                 "dexId": dex_id,
                 "pairAddress": attrs.get("address", ""),
                 "timestamp": time.time(),
+                "quoteUsd": quote_usd,
                 "reserve0": 0, "reserve1": 0, "token0": "", "token1": "",
                 "pool_type": pool_type,
             })
@@ -729,15 +888,20 @@ class DiscoveryEngine:
                 qaddr = qaddr.split("_", 1)[1]
             if not baddr or not qaddr or baddr == "0x0000000000000000000000000000000000000000":
                 continue
-            if qsym not in {"USDC", "USDT"}:
+            if qsym not in ALLOWED_QUOTE_SYMBOLS:
+                continue
+            quote_usd = self._pf(p.get("quoteUsd")) or self._quote_usd_from_pair(p)
+            if not self._is_valid_quote_usd(quote_usd):
                 continue
             liq_raw = p.get("liquidity", {})
             liq = self._pf(liq_raw.get("usd") if isinstance(liq_raw, dict) else liq_raw)
             vol_raw = p.get("volume", {})
             vol = self._pf(vol_raw.get("h24") if isinstance(vol_raw, dict) else vol_raw)
-            if liq < DISCOVERY_MIN_LIQUIDITY:
+            min_liq = DISCOVERY_MIN_LIQUIDITY * (NON_STABLE_LIQUIDITY_MULTIPLIER if qsym not in STABLECOIN_SYMBOLS else 1.0)
+            min_vol = DISCOVERY_MIN_VOLUME * (NON_STABLE_VOLUME_MULTIPLIER if qsym not in STABLECOIN_SYMBOLS else 1.0)
+            if liq < min_liq:
                 continue
-            if vol < DISCOVERY_MIN_VOLUME:
+            if vol < min_vol:
                 continue
             if vol / liq < MIN_VOLUME_LIQ_RATIO:
                 continue
@@ -762,6 +926,7 @@ class DiscoveryEngine:
                 "pool_address": (p.get("pairAddress") or "").lower(),
                 "pool_type": ptype,
                 "quote_symbol": qsym,
+                "quote_usd": quote_usd,
                 "timestamp": p.get("timestamp", time.time()),
                 "reserve0": p.get("reserve0", 0),
                 "reserve1": p.get("reserve1", 0),
@@ -915,12 +1080,13 @@ class RankingEngine:
             mem = token.memory
             # Include tokens with no history but current profit > threshold (bootstrap)
             if mem.opportunity_count < MIN_OPPORTUNITY_COUNT:
-                if token.max_real_profit >= MIN_PROFIT_POTENTIAL_USD:
-                    scored.append((token.max_real_profit * 0.1, token))
+                if token.max_real_profit >= MIN_PROFIT_POTENTIAL_USD and token.confidence_score >= MIN_CONFIDENCE_SCORE:
+                    scored.append((token.max_real_profit * 0.08 + token.confidence_score * 0.12, token))
                 continue
             liq_score = min(1.0, token.liquidity_total / 200000)
             volatility_penalty = min(1.0, mem.spread_std * 10)
             score = (token.max_real_profit * 0.4
+                     + token.confidence_score * 0.15
                      + mem.compute_repeatability_score() * 0.2
                      + min(mem.avg_duration / 10, 1) * 0.15
                      + liq_score * 0.15
@@ -979,12 +1145,19 @@ class ObservationEngine:
                     continue
                 qt = p.get("quoteToken", {})
                 qsym = (qt.get("symbol") or "").upper()
-                if qsym not in {"USDC", "USDT"}:
+                if qsym not in ALLOWED_QUOTE_SYMBOLS:
                     continue
+                quote_usd = 1.0 if qsym in STABLECOIN_SYMBOLS else 0.0
                 price = float(p.get("priceUsd", 0))
+                price_native = float(p.get("priceNative", 0) or 0)
+                if quote_usd == 0.0 and price > 0 and price_native > 0:
+                    quote_usd = price / price_native
+                if not DiscoveryEngine._is_valid_quote_usd(quote_usd):
+                    continue
                 liq_raw = p.get("liquidity", {})
                 liquidity = float(liq_raw.get("usd", 0)) if isinstance(liq_raw, dict) else float(liq_raw) if liq_raw else 0
-                if liquidity < MIN_POOL_LIQUIDITY:
+                min_pool_liquidity = MIN_POOL_LIQUIDITY * (NON_STABLE_LIQUIDITY_MULTIPLIER if qsym not in STABLECOIN_SYMBOLS else 1.0)
+                if liquidity < min_pool_liquidity:
                     continue
                 dex = p.get("dexId", "unknown")
                 pool_addr = p.get("pairAddress", "").lower()
@@ -999,6 +1172,7 @@ class ObservationEngine:
                     "pool_address": pool_addr,
                     "pool_type": pool_type,
                     "quote_symbol": qsym,
+                    "quote_usd": quote_usd,
                     "timestamp": time.time(),
                     "reserve0": 0,
                     "reserve1": 0,
@@ -1018,14 +1192,15 @@ class ObservationEngine:
             spread = token.dex_spread
             profit = token.max_real_profit
             if spread > 0.001:
-                print(f"  OBSERVE {token.symbol} ({token.chain}) | spread={spread*100:.2f}% | profit=${profit:.2f} | alpha={token.memory.alpha_token}")
+                print(f"  OBSERVE {token.symbol} ({token.chain}) | spread={spread*100:.2f}% | profit=${profit:.2f} | conf={token.confidence_score:.2f} | alpha={token.memory.alpha_token}")
 
             token.memory.last_5_spreads.append(spread)
 
             # Slow decay of competition score
             token.memory.competition_score = max(0, token.memory.competition_score * 0.99)
 
-            if spread > MIN_AVG_SPREAD and token.liquidity_total > MIN_LIQUIDITY_TARGET:
+            if (spread > MIN_AVG_SPREAD and token.liquidity_total > MIN_LIQUIDITY_TARGET
+                and token.confidence_score >= MIN_CONFIDENCE_SCORE):
                 if token.key not in self.active_opps:
                     opp = {"start": time.time(), "max_spread": spread}
                     self.active_opps[token.key] = opp
@@ -1039,14 +1214,15 @@ class ObservationEngine:
                     duration = time.time() - opp["start"]
                     if duration < 3.0:
                         token.memory.competition_score = min(20, token.memory.competition_score + 3)
-                    if profit >= MIN_PROFIT_POTENTIAL_USD:
+                    was_successful = profit >= MIN_PROFIT_POTENTIAL_USD
+                    if was_successful:
                         token.memory.successful_cycles += 1
                     else:
                         token.memory.failed_cycles += 1
                     token.memory.update(opp["max_spread"], duration, trade_usd=0, net_profit=profit)
                     token.memory.real_breakouts += 1
                     await self.state_engine.log_opportunity(token.key, opp["max_spread"], duration,
-                                                              token.liquidity_total, profit, token.optimal_trade_size, True)
+                                                              token.liquidity_total, profit, token.optimal_trade_size, was_successful)
                     self.decay_tracker[token.key].append(profit)
                     if len(self.decay_tracker[token.key]) == 5:
                         avg_decay = sum(self.decay_tracker[token.key]) / 5
@@ -1085,7 +1261,9 @@ class MicroDomination:
         last_state_update = 0.0
         while self.running:
             token = self.state_engine.tokens.get(token_key)
-            if not token or token.blacklisted or token.max_real_profit < MIN_PROFIT_POTENTIAL_USD:
+            if (not token or token.blacklisted
+                or token.max_real_profit < MIN_PROFIT_POTENTIAL_USD
+                or token.confidence_score < MIN_CONFIDENCE_SCORE):
                 break
 
             # Skip if state hasn't changed since last check
@@ -1100,12 +1278,13 @@ class MicroDomination:
             now = time.time()
             if spread > last_spread + self.burst_threshold and (now - last_time) < BURST_DETECTION_WINDOW:
                 print(f"🚀 BURST DETECTED: {token.symbol} spread jumped {spread*100:.2f}% in {(now-last_time):.1f}s")
-                if profit >= 2.0 and spread > MIN_AVG_SPREAD:
+                if profit >= 2.0 and spread > MIN_AVG_SPREAD and token.confidence_score >= MIN_CONFIDENCE_SCORE:
                     await self.tg.send(f"⚠️ *BURST* {token.symbol} spread {spread*100:.1f}%", key=f"burst_{token.key}", cooldown=30)
             last_spread = spread
             last_time = now
 
             if (profit >= 2.0 and spread >= MIN_AVG_SPREAD and token.liquidity_total > 50000 and
+                token.confidence_score >= MIN_CONFIDENCE_SCORE and
                 token.active_opportunity and (time.time() - token.active_opportunity["start"]) > 2.0):
                 msg = (f"⚡ *ARBITRAGE OPPORTUNITY* ({token.chain})\n"
                        f"{token.symbol}\n"
@@ -1116,7 +1295,8 @@ class MicroDomination:
                 await self.tg.send(msg, key=token.key, cooldown=60)
                 await self.state_engine.log_opportunity(token.key, spread,
                                                           time.time() - token.active_opportunity["start"],
-                                                          token.liquidity_total, profit, token.optimal_trade_size, True)
+                                                          token.liquidity_total, profit, token.optimal_trade_size,
+                                                          profit >= MIN_PROFIT_POTENTIAL_USD)
 
             if token.memory.alpha_token:
                 await asyncio.sleep(HOT_INTERVAL)
@@ -1203,11 +1383,11 @@ class ArbitrageScanner:
             if top:
                 print(f"\n🏆 TOP {len(top)} PAIRS BY PROFIT POTENTIAL:")
                 for i, t in enumerate(top, 1):
-                    print(f"{i:2d}. {t.symbol:12} ({t.chain}) | profit=${t.max_real_profit:.1f} | spread={t.dex_spread*100:.2f}% | liq=${t.liquidity_total:,.0f}")
+                    print(f"{i:2d}. {t.symbol:12} ({t.chain}) | profit=${t.max_real_profit:.1f} | spread={t.dex_spread*100:.2f}% | conf={t.confidence_score:.2f} | liq=${t.liquidity_total:,.0f}")
                 await self.micro.update_targets(top)
                 top_text = "🏆 *TOP PROFIT POTENTIAL*\n"
                 for t in top[:5]:
-                    top_text += f"{t.symbol} ({t.chain}) | ${t.max_real_profit:.1f} | {t.dex_spread*100:.2f}%\n"
+                    top_text += f"{t.symbol} ({t.chain}) | ${t.max_real_profit:.1f} | {t.dex_spread*100:.2f}% | C:{t.confidence_score:.2f}\n"
                 await self.tg.send(top_text, key="top_pairs", cooldown=300)
                 summary = f"📊 *SUMMARY*\nPairs tracked: {len(await self.state_engine.get_all_tokens())}\nActive watchers: {len(self.micro.tasks)}"
                 await self.tg.send(summary, key="summary", cooldown=600)
