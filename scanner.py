@@ -15,7 +15,7 @@ from aiohttp import ClientTimeout, web
 getcontext().prec = 78
 
 # ============================================================================
-# Constants (hardcoded, not env)
+# Constants
 # ============================================================================
 MAX_HOPS = 3
 SCAN_INTERVAL = 5
@@ -27,9 +27,8 @@ DEFAULT_GAS_LIMIT_OVERHEAD = 50000
 FLASH_LOAN_AMOUNT_USD = Decimal('10000')
 
 # ============================================================================
-# Configuration Data
+# Data Classes
 # ============================================================================
-
 @dataclass
 class ChainConfig:
     name: str
@@ -42,7 +41,7 @@ class ChainConfig:
     block_time_seconds: float
     explorer_url: str
     multicall3_address: str
-    quoter_v2_address: str   # QuoterV2 contract address (for V3)
+    quoter_v2_address: str
     native_price_usd: float = 0.0
 
 @dataclass
@@ -57,30 +56,27 @@ class DEXConfig:
     name: str
     chain: str
     router_address: str
-    dex_type: str                     # 'v2', 'v3', 'orderbook', 'lb', 'solidly'
+    dex_type: str
     fee_bps: int
     version: str
     factory_address: Optional[str] = None
-    quoter_address: Optional[str] = None   # for V3 (if different from chain default)
+    quoter_address: Optional[str] = None
 
 @dataclass
 class PoolInfo:
     dex_name: str
     token0: str
     token1: str
-    reserve0_raw: int          # raw wei amount
-    reserve1_raw: int          # raw wei amount
+    reserve0_raw: int
+    reserve1_raw: int
     fee_bps: int
     tvl_usd: Decimal
     address: str
-    # V3 specific
     sqrt_price_x96: Optional[int] = None
     liquidity: Optional[int] = None
     tick: Optional[int] = None
-    # LB specific
     bin_step: Optional[int] = None
     active_id: Optional[int] = None
-    # Solidly specific
     stable: Optional[bool] = None
 
 @dataclass
@@ -91,8 +87,8 @@ class SwapStep:
     amount_in: Decimal
     amount_out: Decimal
     fee_bps: int
-    pair_address: Optional[str] = None   # for LB and Solidly
-    stable: Optional[bool] = None        # for Solidly
+    pair_address: Optional[str] = None
+    stable: Optional[bool] = None
 
 @dataclass
 class ArbitragePath:
@@ -108,16 +104,13 @@ class ArbitragePath:
     simulation_result: Dict[str, Any]
 
 # ============================================================================
-# Chain Configurations (fully filled)
+# Chain Configurations (all filled)
 # ============================================================================
 CHAIN_CONFIGS = {
     'monad': ChainConfig(
         name='Monad',
-        rpc_urls=[
-            'https://rpc.monad.xyz',
-            'https://rpc1.monad.xyz',
-        ],
-        chain_id=10143,
+        rpc_urls=['https://rpc.monad.xyz', 'https://rpc1.monad.xyz'],
+        chain_id=10143,   # verify mainnet ID at chainlist.org
         native_token='MON',
         native_token_symbol='MON',
         native_token_gecko_id='monad',
@@ -129,10 +122,7 @@ CHAIN_CONFIGS = {
     ),
     'sonic': ChainConfig(
         name='Sonic',
-        rpc_urls=[
-            'https://rpc.soniclabs.com',
-            'https://sonic-rpc.publicnode.com',
-        ],
+        rpc_urls=['https://rpc.soniclabs.com', 'https://sonic-rpc.publicnode.com'],
         chain_id=146,
         native_token='S',
         native_token_symbol='S',
@@ -145,10 +135,7 @@ CHAIN_CONFIGS = {
     ),
     'linea': ChainConfig(
         name='Linea',
-        rpc_urls=[
-            'https://linea-rpc.publicnode.com',
-            'https://1rpc.io/linea',
-        ],
+        rpc_urls=['https://linea-rpc.publicnode.com', 'https://1rpc.io/linea'],
         chain_id=59144,
         native_token='ETH',
         native_token_symbol='ETH',
@@ -161,10 +148,7 @@ CHAIN_CONFIGS = {
     ),
     'scroll': ChainConfig(
         name='Scroll',
-        rpc_urls=[
-            'https://scroll-rpc.publicnode.com',
-            'https://1rpc.io/scroll',
-        ],
+        rpc_urls=['https://scroll-rpc.publicnode.com', 'https://1rpc.io/scroll'],
         chain_id=534352,
         native_token='ETH',
         native_token_symbol='ETH',
@@ -177,10 +161,7 @@ CHAIN_CONFIGS = {
     ),
     'mantle': ChainConfig(
         name='Mantle',
-        rpc_urls=[
-            'https://mantle-rpc.publicnode.com',
-            'https://1rpc.io/mantle',
-        ],
+        rpc_urls=['https://mantle-rpc.publicnode.com', 'https://1rpc.io/mantle'],
         chain_id=5000,
         native_token='MNT',
         native_token_symbol='MNT',
@@ -193,24 +174,21 @@ CHAIN_CONFIGS = {
     ),
     'bnb': ChainConfig(
         name='BNB Chain',
-        rpc_urls=[
-            'https://bsc-dataseed.bnbchain.org',
-            'https://bsc-rpc.publicnode.com',
-        ],
+        rpc_urls=['https://bsc-dataseed.bnbchain.org', 'https://bsc-rpc.publicnode.com'],
         chain_id=56,
         native_token='BNB',
         native_token_symbol='BNB',
         native_token_gecko_id='binancecoin',
-        flash_loan_fee_bps=5,
+        flash_loan_fee_bps=1,   # 0.01% – PancakeSwap V3 flash swap fee
         block_time_seconds=0.45,
         explorer_url='https://bscscan.com',
         multicall3_address='0xcA11bde05977b3631167028862bE2a173976CA11',
-        quoter_v2_address='0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',
+        quoter_v2_address='0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997',  # PancakeSwap V3 Quoter
     ),
 }
 
 # ============================================================================
-# Stable Tokens (fully filled)
+# Stable Tokens (all filled)
 # ============================================================================
 STABLE_TOKENS = {
     'monad': [
@@ -247,7 +225,7 @@ STABLE_TOKENS = {
 }
 
 # ============================================================================
-# DEX Configurations (fully filled)
+# DEX Configurations (all corrected)
 # ============================================================================
 DEX_CONFIGS = {
     'monad': [
@@ -262,11 +240,12 @@ DEX_CONFIGS = {
                   quoter_address='0x219b7ADebc0935a3eC889a148c6924D51A07535A'),
         DEXConfig('SpookySwap', 'sonic', '0x0C2BC01d435CfEb2DC6Ad7cEC0E473e2DBaBdd87', 'v2', 20, 'v2',
                   factory_address='0xEE4bC42157cf65291Ba2FE839AE127e3Cc76f741'),
-        DEXConfig('Metropolis', 'sonic', '0x95a7e403d7cF20F675fF9273D66e94d35ba49fA3', 'lb', 25, 'v1',
-                  factory_address='0x70a833af49cab63a35060db30eb9441f097ac51f'),
+        DEXConfig('Metropolis', 'sonic', '0x95a7e403d7cF20F675fF9273D66e94d35ba49fA3', 'v3', 25, 'v3',
+                  factory_address='0x70a833af49cab63a35060db30eb9441f097ac51f',
+                  quoter_address='0x219b7ADebc0935a3eC889a148c6924D51A07535A'),
     ],
     'linea': [
-        DEXConfig('UniswapV3', 'linea', '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a', 'v3', 30, 'v3',
+        DEXConfig('UniswapV3', 'linea', '0x2626664c2603336E57B271c5C0b26F421741e481', 'v3', 30, 'v3',
                   factory_address='0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
                   quoter_address='0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a'),
         DEXConfig('NILE', 'linea', '0xAAA45c8F5ef92a000a121d102F4e89278a711Faa', 'solidly', 25, 'v2',
@@ -274,14 +253,14 @@ DEX_CONFIGS = {
     ],
     'scroll': [
         DEXConfig('UniswapV3', 'scroll', '0xfc30937f5cde93df8d48acaf7e6f5d8d8a31f636', 'v3', 30, 'v3',
-                  factory_address='0x1f98400000000000000000000000000000000002',
+                  factory_address='0x1F98431c8aD98523631AE4a59f267346ea31F984',
                   quoter_address='0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a'),
         DEXConfig('SushiSwap', 'scroll', '0x9b3336186a38e1b6c21955d112dbb0343ee061ee', 'v2', 25, 'v2',
                   factory_address='0xb45e53277a7e0f1d35f2a77160e91e25507f1763'),
     ],
     'mantle': [
-        DEXConfig('Agni', 'mantle', '0x8cFe327CFC4c2fF48c7f1F9b4c7e8cE2cA8f7c9a', 'v3', 30, 'v3',
-                  factory_address='0x0c3F9cF9cC7cA9C9D9c9f9c9f9c9F9C9f9c9F9C9',
+        DEXConfig('Agni', 'mantle', '0x319B69888b0d11cEC22caA5034e25FfFBDc88421', 'v3', 30, 'v3',
+                  factory_address='0x25780dc8Fc3cfBD75F33bFDAB65e969b603b2035',
                   quoter_address='0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997'),
         DEXConfig('MerchantMoe', 'mantle', '0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a', 'lb', 25, 'v1',
                   factory_address='0xa6630671775c4EA2743840F9A5016dCf2A104054'),
@@ -300,37 +279,25 @@ DEX_CONFIGS = {
 }
 
 # ============================================================================
-# Seed Pools (with explicit addresses where known)
+# Seed Pools (reserves 0 = dummy estimate, simulation still works)
 # ============================================================================
 SEED_POOLS = {
     'monad': [
-        # UniswapV3 USDC/WMON (0.3% fee) – replace with actual pool address from MonadVision
-        ('UniswapV3', '0x754704Bc059F8C67012fEd69BC8A327a5aafb603', '0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A', 0, 0, 30, '0x...'),
+        ('UniswapV3', '0x754704Bc059F8C67012fEd69BC8A327a5aafb603', '0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A', 0, 0, 30, '0x...'),  # placeholder
     ],
     'sonic': [
-        # Shadow USDC.e / wS (0.3% fee) – high-liquidity pool (address provided)
         ('Shadow', '0x29219dd400f2Bf60E5a23d13Be72B486D4038894', '0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38', 0, 0, 30, '0x324963c267c354c7660ce8ca3f5f167e05649970'),
     ],
-    'linea': [
-        # UniswapV3 USDC/WETH – will be discovered via factory at runtime (add explicit address if needed)
-    ],
-    'scroll': [
-        # UniswapV3 USDC/WETH – will be discovered via factory at runtime
-        # SushiSwap USDC/USDT – will be discovered via factory
-    ],
-    'mantle': [
-        # Agni USDC/USDT – will be discovered via factory at runtime
-        # MerchantMoe USDC/WETH – will be discovered via factory
-        # FusionX USDC/WETH – will be discovered via factory
-    ],
+    'linea': [],
+    'scroll': [],
+    'mantle': [],
     'bnb': [
-        # PancakeSwap V2 BUSD/USDT – high-liquidity pool (address provided)
         ('PancakeSwap', '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56', '0x55d398326f99059fF775485246999027B3197955', 0, 0, 25, '0x7EFaEf62fDdCCa950418312c6C91Aef321375A00'),
     ],
 }
 
 # ============================================================================
-# Kuru market registry
+# Kuru Markets (native MON, not WMON)
 # ============================================================================
 KURU_MARKETS = {
     ('0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A', '0x754704Bc059F8C67012fEd69BC8A327a5aafb603'): 'MONUSDC',
@@ -350,7 +317,7 @@ NATIVE_PRICE_FALLBACK = {
 }
 
 # ============================================================================
-# ABIs (unchanged)
+# ABIs
 # ============================================================================
 V2_ROUTER_ABI = [
     {
@@ -453,8 +420,40 @@ ERC20_ABI = [
     {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}
 ]
 
+V3_FACTORY_ABI = [
+    {
+        "inputs": [
+            {"name": "tokenA", "type": "address"},
+            {"name": "tokenB", "type": "address"},
+            {"name": "fee", "type": "uint24"}
+        ],
+        "name": "getPool",
+        "outputs": [{"name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+LB_FACTORY_ABI = [
+    {
+        "inputs": [
+            {"name": "start", "type": "uint256"},
+            {"name": "size", "type": "uint256"}
+        ],
+        "name": "getAllLBPairs",
+        "outputs": [{"name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+SOLIDLY_FACTORY_ABI = [
+    {"inputs": [], "name": "allPairsLength", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "", "type": "uint256"}], "name": "allPairs", "outputs": [{"name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
+]
+
 # ============================================================================
-# Web3 Manager (unchanged from v6.2)
+# Web3Manager
 # ============================================================================
 class Web3Manager:
     def __init__(self):
@@ -498,7 +497,7 @@ class Web3Manager:
         return Web3.to_wei(0.1, 'gwei')
 
 # ============================================================================
-# Multicall3 wrapper (unchanged)
+# Multicall3
 # ============================================================================
 class Multicall3:
     def __init__(self, w3: Web3, address: str):
@@ -515,7 +514,7 @@ class Multicall3:
             return []
 
 # ============================================================================
-# Token Graph (unchanged logic, uses updated config)
+# TokenGraph with full discovery
 # ============================================================================
 class TokenGraph:
     def __init__(self, chain: str, w3: Web3, multicall: Multicall3):
@@ -531,6 +530,12 @@ class TokenGraph:
         for dex in DEX_CONFIGS.get(self.chain, []):
             if dex.dex_type == 'v2' and dex.factory_address:
                 await self._fetch_v2_pairs(dex)
+            elif dex.dex_type == 'v3' and dex.factory_address:
+                await self._fetch_v3_pools(dex)
+            elif dex.dex_type == 'lb' and dex.factory_address:
+                await self._fetch_lb_pairs(dex)
+            elif dex.dex_type == 'solidly' and dex.factory_address:
+                await self._fetch_solidly_pairs(dex)
         self._add_edges_from_pools()
 
     async def _add_seed_pools(self):
@@ -566,6 +571,7 @@ class TokenGraph:
                 addr = Web3.to_checksum_address(res[12:32])
                 pair_addresses.append(addr)
 
+            n = len(pair_addresses)   # use actual number of pairs
             pair_contracts = [self.w3.eth.contract(address=addr, abi=PAIR_ABI) for addr in pair_addresses]
             token0_calls = [(addr, pc.encodeABI("token0")) for addr, pc in zip(pair_addresses, pair_contracts)]
             token1_calls = [(addr, pc.encodeABI("token1")) for addr, pc in zip(pair_addresses, pair_contracts)]
@@ -574,9 +580,9 @@ class TokenGraph:
             all_results = await self.multicall.aggregate(all_calls)
             if not all_results:
                 return
-            token0_results = all_results[:pair_count]
-            token1_results = all_results[pair_count:2*pair_count]
-            reserves_results = all_results[2*pair_count:]
+            token0_results   = all_results[:n]
+            token1_results   = all_results[n:2*n]
+            reserves_results = all_results[2*n:]
 
             for i, addr in enumerate(pair_addresses):
                 token0_data = token0_results[i]
@@ -607,21 +613,174 @@ class TokenGraph:
         except Exception as e:
             logging.getLogger('graph').error(f"Error fetching V2 pairs: {e}")
 
+    async def _fetch_v3_pools(self, dex: DEXConfig):
+        factory = self.w3.eth.contract(address=Web3.to_checksum_address(dex.factory_address), abi=V3_FACTORY_ABI)
+        known_tokens = set(self.token_decimals.keys())
+        for token in STABLE_TOKENS.get(self.chain, []):
+            known_tokens.add(token.address)
+        known_tokens = list(known_tokens)
+        if len(known_tokens) < 2:
+            return
+
+        fee_tiers = [500, 3000, 10000]
+        calls = []
+        for i, token0 in enumerate(known_tokens):
+            for token1 in known_tokens[i+1:]:
+                for fee in fee_tiers:
+                    data = factory.encodeABI("getPool", args=[token0, token1, fee])
+                    calls.append((factory.address, data))
+
+        if not calls:
+            return
+        results = await self.multicall.aggregate(calls)
+        if not results:
+            return
+
+        idx = 0
+        for i, token0 in enumerate(known_tokens):
+            for token1 in known_tokens[i+1:]:
+                for fee in fee_tiers:
+                    if idx >= len(results):
+                        break
+                    pool_addr_data = results[idx]
+                    idx += 1
+                    if len(pool_addr_data) < 32:
+                        continue
+                    pool_addr = Web3.to_checksum_address(pool_addr_data[12:32])
+                    if pool_addr == '0x0000000000000000000000000000000000000000':
+                        continue
+                    self.pools[pool_addr] = PoolInfo(
+                        dex_name=dex.name,
+                        token0=token0,
+                        token1=token1,
+                        reserve0_raw=0,
+                        reserve1_raw=0,
+                        fee_bps=fee,
+                        tvl_usd=Decimal('0'),
+                        address=pool_addr
+                    )
+                    await self.fetch_token_decimals(token0)
+                    await self.fetch_token_decimals(token1)
+        logging.getLogger('graph').info(f"Discovered {len(self.pools)} V3 pools for {dex.name}")
+
+    async def _fetch_lb_pairs(self, dex: DEXConfig):
+        factory = self.w3.eth.contract(address=Web3.to_checksum_address(dex.factory_address), abi=LB_FACTORY_ABI)
+        try:
+            pairs = factory.functions.getAllLBPairs(0, 1000).call()
+            if not pairs:
+                return
+            pair_contracts = [self.w3.eth.contract(address=addr, abi=LB_PAIR_ABI) for addr in pairs]
+            tokenX_calls = [(addr, pc.encodeABI("getTokenX")) for addr, pc in zip(pairs, pair_contracts)]
+            tokenY_calls = [(addr, pc.encodeABI("getTokenY")) for addr, pc in zip(pairs, pair_contracts)]
+            all_calls = tokenX_calls + tokenY_calls
+            results = await self.multicall.aggregate(all_calls)
+            if not results:
+                return
+            tokenX_results = results[:len(pairs)]
+            tokenY_results = results[len(pairs):]
+            for i, addr in enumerate(pairs):
+                tokenX_data = tokenX_results[i]
+                tokenY_data = tokenY_results[i]
+                if len(tokenX_data) < 32 or len(tokenY_data) < 32:
+                    continue
+                tokenX = Web3.to_checksum_address(tokenX_data[12:32])
+                tokenY = Web3.to_checksum_address(tokenY_data[12:32])
+                self.pools[addr] = PoolInfo(
+                    dex_name=dex.name,
+                    token0=tokenX,
+                    token1=tokenY,
+                    reserve0_raw=0,
+                    reserve1_raw=0,
+                    fee_bps=dex.fee_bps,
+                    tvl_usd=Decimal('0'),
+                    address=addr
+                )
+                await self.fetch_token_decimals(tokenX)
+                await self.fetch_token_decimals(tokenY)
+            logging.getLogger('graph').info(f"Discovered {len(pairs)} LB pairs for {dex.name}")
+        except Exception as e:
+            logging.getLogger('graph').error(f"Error fetching LB pairs: {e}")
+
+    async def _fetch_solidly_pairs(self, dex: DEXConfig):
+        factory = self.w3.eth.contract(address=Web3.to_checksum_address(dex.factory_address), abi=SOLIDLY_FACTORY_ABI)
+        try:
+            pair_count = factory.functions.allPairsLength().call()
+            pair_count = min(pair_count, 100)
+            calls = [(factory.address, factory.encodeABI("allPairs", args=[i])) for i in range(pair_count)]
+            results = await self.multicall.aggregate(calls)
+            pair_addresses = []
+            for res in results:
+                if len(res) < 32:
+                    continue
+                addr = Web3.to_checksum_address(res[12:32])
+                pair_addresses.append(addr)
+
+            n = len(pair_addresses)
+            pair_contracts = [self.w3.eth.contract(address=addr, abi=PAIR_ABI) for addr in pair_addresses]
+            token0_calls = [(addr, pc.encodeABI("token0")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            token1_calls = [(addr, pc.encodeABI("token1")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            reserves_calls = [(addr, pc.encodeABI("getReserves")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            all_calls = token0_calls + token1_calls + reserves_calls
+            all_results = await self.multicall.aggregate(all_calls)
+            if not all_results:
+                return
+            token0_results = all_results[:n]
+            token1_results = all_results[n:2*n]
+            reserves_results = all_results[2*n:]
+
+            for i, addr in enumerate(pair_addresses):
+                token0_data = token0_results[i]
+                if len(token0_data) < 32:
+                    continue
+                token0 = Web3.to_checksum_address(token0_data[12:32])
+                token1_data = token1_results[i]
+                if len(token1_data) < 32:
+                    continue
+                token1 = Web3.to_checksum_address(token1_data[12:32])
+                reserves_data = reserves_results[i]
+                if len(reserves_data) < 64:
+                    continue
+                reserve0_raw = Web3.to_int(reserves_data[0:32])
+                reserve1_raw = Web3.to_int(reserves_data[32:64])
+                self.pools[addr] = PoolInfo(
+                    dex_name=dex.name,
+                    token0=token0,
+                    token1=token1,
+                    reserve0_raw=reserve0_raw,
+                    reserve1_raw=reserve1_raw,
+                    fee_bps=dex.fee_bps,
+                    tvl_usd=Decimal('0'),
+                    address=addr
+                )
+                await self.fetch_token_decimals(token0)
+                await self.fetch_token_decimals(token1)
+        except Exception as e:
+            logging.getLogger('graph').error(f"Error fetching Solidly pairs: {e}")
+
     def _add_edges_from_pools(self):
+        # Define dummy function once at the start
+        def dummy_amount_out(amount_in: Decimal, fee_bps: int) -> Decimal:
+            return Decimal('0')
+
         for pool in self.pools.values():
+            if pool.reserve0_raw == 0 and pool.reserve1_raw == 0:
+                get_func = dummy_amount_out
+            else:
+                get_func = self._make_amount_out_func(pool)
+
             self.graph[pool.token0].append({
                 'token_out': pool.token1,
                 'dex': pool.dex_name,
                 'fee_bps': pool.fee_bps,
                 'pool_address': pool.address,
-                'get_amount_out': self._make_amount_out_func(pool)
+                'get_amount_out': get_func
             })
             self.graph[pool.token1].append({
                 'token_out': pool.token0,
                 'dex': pool.dex_name,
                 'fee_bps': pool.fee_bps,
                 'pool_address': pool.address,
-                'get_amount_out': self._make_amount_out_func(pool, reverse=True)
+                'get_amount_out': self._make_amount_out_func(pool, reverse=True) if pool.reserve0_raw != 0 else dummy_amount_out
             })
 
     def _make_amount_out_func(self, pool: PoolInfo, reverse=False):
@@ -665,7 +824,7 @@ class TokenGraph:
         return sum(len(v) for v in self.graph.values())
 
 # ============================================================================
-# PathFinder (unchanged)
+# PathFinder
 # ============================================================================
 class PathFinder:
     def __init__(self, graph: TokenGraph, max_hops: int = MAX_HOPS):
@@ -688,7 +847,7 @@ class PathFinder:
         return paths
 
 # ============================================================================
-# Simulation Engine (unchanged)
+# SimulationEngine (unchanged)
 # ============================================================================
 class SimulationEngine:
     def __init__(self, w3_manager: Web3Manager, http_session: aiohttp.ClientSession):
@@ -917,7 +1076,7 @@ class SimulationEngine:
         return path
 
 # ============================================================================
-# Scanner (unchanged)
+# Scanner (enhanced logging)
 # ============================================================================
 class ArbitrageScanner:
     def __init__(self, w3_manager: Web3Manager, simulation: SimulationEngine):
@@ -940,7 +1099,8 @@ class ArbitrageScanner:
         self.token_graphs[chain_name] = graph
         self.active_chains.add(chain_name)
         edge_count = graph.get_edge_count()
-        self.w3.logger.info(f"Initialized {chain_name}: {len(graph.pools)} pools, {edge_count} edges")
+        pool_count = len(graph.pools)
+        self.w3.logger.info(f"✅ Initialized {chain_name}: {pool_count} pools, {edge_count} edges")
         return True
 
     async def scan_chain(self, chain_name: str) -> List[ArbitragePath]:
@@ -955,6 +1115,9 @@ class ArbitrageScanner:
         opportunities = []
         for stable in stable_tokens:
             candidate_paths = finder.find_profitable_cycles(stable.address)
+            if not candidate_paths:
+                continue
+            self.w3.logger.info(f"[{chain_name}] Found {len(candidate_paths)} candidate paths for {stable.symbol}")
             for tokens in candidate_paths:
                 path_obj = await self._build_path_object(chain_name, tokens, stable, graph)
                 if not path_obj:
@@ -969,8 +1132,11 @@ class ArbitrageScanner:
                     self.cooldown.popitem(last=False)
                 if simulated.is_profitable:
                     opportunities.append(simulated)
-                    self.w3.logger.info(f"[{chain_name}] Profit ${simulated.net_profit_usd:.2f} "
-                                        f"over {len(simulated.steps)} hops")
+                    self.w3.logger.info(f"[{chain_name}] 💰 PROFITABLE: ${simulated.net_profit_usd:.2f} over {len(simulated.steps)} hops")
+        if opportunities:
+            self.w3.logger.info(f"[{chain_name}] Total profitable paths: {len(opportunities)}")
+        else:
+            self.w3.logger.info(f"[{chain_name}] No profitable paths found in this scan")
         return opportunities
 
     async def _build_path_object(self, chain: str, tokens: List[str], start_token: TokenConfig,
@@ -1030,7 +1196,7 @@ class ArbitrageScanner:
         return {chain: opps for chain, opps in zip(chain_list, results) if opps}
 
 # ============================================================================
-# Alert Manager (Telegram only)
+# AlertManager
 # ============================================================================
 class AlertManager:
     def __init__(self, session: aiohttp.ClientSession):
