@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+NicheMultiHopArbBot - Multi-Chain Flash Loan Arbitrage Scanner (v10.4)
+Fixed encodeABI → encode_abi for web3.py v6 compatibility.
+"""
+
 import os
 import asyncio
 import time
@@ -562,7 +568,7 @@ class TokenGraph:
         try:
             pair_count = factory.functions.allPairsLength().call()
             pair_count = min(pair_count, 100)
-            calls = [(factory.address, factory.encodeABI("allPairs", args=[i])) for i in range(pair_count)]
+            calls = [(factory.address, factory.encode_abi("allPairs", args=[i])) for i in range(pair_count)]
             results = await self.multicall.aggregate(calls)
             pair_addresses = []
             for res in results:
@@ -573,9 +579,9 @@ class TokenGraph:
 
             n = len(pair_addresses)   # use actual number of pairs
             pair_contracts = [self.w3.eth.contract(address=addr, abi=PAIR_ABI) for addr in pair_addresses]
-            token0_calls = [(addr, pc.encodeABI("token0")) for addr, pc in zip(pair_addresses, pair_contracts)]
-            token1_calls = [(addr, pc.encodeABI("token1")) for addr, pc in zip(pair_addresses, pair_contracts)]
-            reserves_calls = [(addr, pc.encodeABI("getReserves")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            token0_calls = [(addr, pc.encode_abi("token0")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            token1_calls = [(addr, pc.encode_abi("token1")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            reserves_calls = [(addr, pc.encode_abi("getReserves")) for addr, pc in zip(pair_addresses, pair_contracts)]
             all_calls = token0_calls + token1_calls + reserves_calls
             all_results = await self.multicall.aggregate(all_calls)
             if not all_results:
@@ -627,7 +633,7 @@ class TokenGraph:
         for i, token0 in enumerate(known_tokens):
             for token1 in known_tokens[i+1:]:
                 for fee in fee_tiers:
-                    data = factory.encodeABI("getPool", args=[token0, token1, fee])
+                    data = factory.encode_abi("getPool", args=[token0, token1, fee])
                     calls.append((factory.address, data))
 
         if not calls:
@@ -670,8 +676,8 @@ class TokenGraph:
             if not pairs:
                 return
             pair_contracts = [self.w3.eth.contract(address=addr, abi=LB_PAIR_ABI) for addr in pairs]
-            tokenX_calls = [(addr, pc.encodeABI("getTokenX")) for addr, pc in zip(pairs, pair_contracts)]
-            tokenY_calls = [(addr, pc.encodeABI("getTokenY")) for addr, pc in zip(pairs, pair_contracts)]
+            tokenX_calls = [(addr, pc.encode_abi("getTokenX")) for addr, pc in zip(pairs, pair_contracts)]
+            tokenY_calls = [(addr, pc.encode_abi("getTokenY")) for addr, pc in zip(pairs, pair_contracts)]
             all_calls = tokenX_calls + tokenY_calls
             results = await self.multicall.aggregate(all_calls)
             if not results:
@@ -706,7 +712,7 @@ class TokenGraph:
         try:
             pair_count = factory.functions.allPairsLength().call()
             pair_count = min(pair_count, 100)
-            calls = [(factory.address, factory.encodeABI("allPairs", args=[i])) for i in range(pair_count)]
+            calls = [(factory.address, factory.encode_abi("allPairs", args=[i])) for i in range(pair_count)]
             results = await self.multicall.aggregate(calls)
             pair_addresses = []
             for res in results:
@@ -717,9 +723,9 @@ class TokenGraph:
 
             n = len(pair_addresses)
             pair_contracts = [self.w3.eth.contract(address=addr, abi=PAIR_ABI) for addr in pair_addresses]
-            token0_calls = [(addr, pc.encodeABI("token0")) for addr, pc in zip(pair_addresses, pair_contracts)]
-            token1_calls = [(addr, pc.encodeABI("token1")) for addr, pc in zip(pair_addresses, pair_contracts)]
-            reserves_calls = [(addr, pc.encodeABI("getReserves")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            token0_calls = [(addr, pc.encode_abi("token0")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            token1_calls = [(addr, pc.encode_abi("token1")) for addr, pc in zip(pair_addresses, pair_contracts)]
+            reserves_calls = [(addr, pc.encode_abi("getReserves")) for addr, pc in zip(pair_addresses, pair_contracts)]
             all_calls = token0_calls + token1_calls + reserves_calls
             all_results = await self.multicall.aggregate(all_calls)
             if not all_results:
