@@ -1,6 +1,6 @@
-aiohttp
 aiosqlite
-web3
 eth-abi
 nest_asyncio
 python-dotenv
+web3>=6.0.0
+aiohttp>=3.9.0
